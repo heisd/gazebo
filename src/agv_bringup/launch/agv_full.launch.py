@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""
+AGV 仓储系统完整启动文件 (Humble 最终修正版)
+解决 ros2_control_node 插件冲突及控制器激活失败问题
+"""
+import os, subprocess
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import (ExecuteProcess, DeclareLaunchArgument,
+                            IncludeLaunchDescription,
+                            TimerAction, LogInfo)
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+def get_robot_description():
+    desc_dir = get_package_share_directory('agv_description')
+    urdf = os.path.join(desc_dir, 'urdf', 'agv_robot.urdf.xacro')
+    # 使用 subprocess 解析 xacro
+    result = subprocess.run(['xacro', urdf], capture_output=True, text=True)
+    return result.stdout
+
+def generate_launch_description():
+    desc_dir = get_package_share_directory('agv_description')
+    gaz_dir  = get_package_share_directory('agv_gazebo')
+    nav_dir  = get_package_share_directory('agv_navigation')
+
+    world    = os.path.join(gaz_dir,  'worlds', 'warehouse.world')
+    nav_cfg  = os.path.join(nav_dir,  'config', 'nav2_params.yaml')
+    nav_launch = os.path.join(nav_dir, 'launch', 'navigation.launch.py')
+
+    robot_desc = get_robot_description()
+    use_sim    = LaunchConfiguration('use_sim_time', default='true')
+
+    # 1. Gazebo 启动 (核心仿真环境)
+    gazebo = ExecuteProcess(
+        cmd=['gazebo', '--verbose', world,
+             '-s', 'libgazebo_ros_init.so',
+             '-s', 'libgazebo_ros_factory.so'],
+        output='screen')
+
+    # 2. Robot State Publisher (发布静态坐标变换)
+    rsp = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        parameters=[{'robot_description': robot_desc,
+                     'use_sim_time': use_sim}],
+        output='screen')
+
+    # 2.1 Joint State Publisher
+    # 为 continuous 轮关节发布 joint_states，确保 RViz 能看到 base_link -> wheel_link。
+    jsp = Node(
+        package='joint_state_publisher',
+        executable='joint_state_publisher',
+        parameters=[{'robot_description': robot_desc,
+                     'use_sim_time': use_sim}],
+        output='screen')
+
+    # 3. 在 Gazebo 中生成 AGV 实体
+    spawn = Node(
+        package='gazebo_ros', executable='spawn_entity.py',
+        arguments=['-topic', 'robot_description',
+                   '-entity', 'agv_robot',
+                   '-x', '0.0', '-y', '0.0', '-z', '0.12'],
+        output='screen')
+
+    # --- 注意：移除了独立的 ros2_control_node，由 Gazebo 插件 libgazebo_ros2_control 接管 ---
+
+    # 4. 加载 joint_state_broadcaster
+    # spawner 会等待 /controller_manager 就绪，避免一次性 ros2 control 命令过早执行后失败。
+    load_jsb = Node(
+        package='controller_manager',
+        executable='spawner',
+        arguments=['joint_state_broadcaster',
+                   '--controller-manager', '/controller_manager',
+                   '--controller-manager-timeout', '60'],
+        output='screen')
+
+    # 5. 加载 diff_drive_controller
+    load_ddc = Node(
+        package='controller_manager',
+        executable='spawner',
+        arguments=['diff_drive_controller',
+                   '--controller-manager', '/controller_manager',
+                   '--controller-manager-timeout', '60'],
+        output='screen')
+
+    # 6. SLAM 建图 (异步 SLAM)
+    slam_params = [nav_cfg, {'use_sim_time': use_sim}] if os.path.exists(nav_cfg) else [{'use_sim_time': use_sim}]
+    slam = Node(
+        package='slam_toolbox',
+        executable='async_slam_toolbox_node',
+        name='slam_toolbox',
+        parameters=slam_params,
+        remappings=[('/scan', '/agv/scan')],
+        output='screen')
+
+    # 7. Nav2 导航栈
+    nav2 = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(nav_launch),
+        launch_arguments={
+            'use_sim_time': use_sim,
+            'params_file': nav_cfg,
+            'autostart': 'true',
+        }.items())
+
+    # 8. AGV 调度节点
+    scheduler = Node(
+        package='agv_scheduler',
+        executable='scheduler_node',
+        name='agv_scheduler',
+        parameters=[{'use_sim_time': use_sim}],
+        output='screen')
+
+    # 9. RViz2 (可视化)
+    rviz = Node(
+        package='rviz2', executable='rviz2',
+        name='rviz2', output='screen')
+
+    return LaunchDescription([
+        DeclareLaunchArgument('use_sim_time', default_value='true'),
+        LogInfo(msg='[AGV] 启动 Gazebo 仿真及控制链路...'),
+        
+        gazebo,
+        TimerAction(period=5.0,  actions=[rsp]),
+        TimerAction(period=5.5,  actions=[jsp]),
+        TimerAction(period=7.0,  actions=[spawn]),
+        # 给 Gazebo 插件初始化的时间，适当延长等待
+        TimerAction(period=12.0, actions=[load_jsb]),
+        TimerAction(period=14.0, actions=[load_ddc]),
+        TimerAction(period=16.0, actions=[slam]),
+        TimerAction(period=20.0, actions=[nav2]),
+        TimerAction(period=24.0, actions=[scheduler]),
+        TimerAction(period=26.0, actions=[rviz]),
+    ])
