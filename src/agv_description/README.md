@@ -31,13 +31,35 @@ agv_description
 
 ## 关键接口
 
-机器人命名空间在 URDF 的 Gazebo diff drive 插件中设置为 `/agv`：
+机器人命名空间在 URDF 的 Gazebo diff drive 插件中默认设置为 `/agv`：
 
 - 输入：`/agv/cmd_vel`
 - 输出：`/agv/odom`
 - 输出：`/agv/scan`
 - 输出 TF：`odom -> base_footprint -> base_link`
 - 控制器管理器：`/controller_manager`
+
+同一个 Xacro 支持通过参数生成多台相同模型的车：
+
+```bash
+xacro src/agv_description/urdf/agv_robot.urdf.xacro \
+  namespace:=agv_01 prefix:=agv_01_ enable_ros2_control:=false
+```
+
+两车仿真中使用的关键参数：
+
+| 参数 | 示例 | 作用 |
+| --- | --- | --- |
+| `namespace` | `agv_01` | Gazebo 插件发布/订阅的话题命名空间 |
+| `prefix` | `agv_01_` | link、joint 和 TF frame 前缀 |
+| `enable_ros2_control` | `false` | 两车底座模式关闭 ros2_control，避免 controller manager 冲突 |
+
+因此 `agv_01` 会使用：
+
+- 输入：`/agv_01/cmd_vel`
+- 输出：`/agv_01/odom`
+- 输出：`/agv_01/scan`
+- 输出 TF：`agv_01_odom -> agv_01_base_footprint -> agv_01_base_link`
 
 `ros2_control` 中声明的轮关节：
 
@@ -69,6 +91,6 @@ ros2 launch agv_bringup agv_full.launch.py
 
 ## 当前注意点
 
-- `lidar_link` 搭载 Gazebo ray laser，输出 `sensor_msgs/msg/LaserScan` 到 `/agv/scan`，frame 为 `lidar_link`。
+- `lidar_link` 搭载 Gazebo ray laser，输出 `sensor_msgs/msg/LaserScan` 到 `/agv/scan`，frame 默认为 `lidar_link`；多车模式会按 `prefix` 改为 `agv_01_lidar_link`、`agv_02_lidar_link`。
 - URDF 中同时包含 `gazebo_ros2_control` 和 `gazebo_ros_diff_drive` 相关配置；后续如果只走 `ros2_control` 的 `diff_drive_controller`，应统一控制链路，避免两个底盘插件争用同一车辆运动模型。
 - `config/ros2_controllers.yaml` 里的 `wheel_radius` 是 `0.12`，而 Xacro 里的 `wheel_r` 是 `0.10`。如果里程计或速度比例异常，应优先校准这两个参数。

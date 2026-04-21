@@ -38,7 +38,7 @@ Gazebo 仿真环境
 | 出货站 | `(9, 0)` |
 | 充电区 | `(9, -8)` |
 
-这些坐标已经在 `agv_scheduler` 的 `SHELVES`、`STATION`、`CHARGING` 中复用。修改 world 布局后，需要同步调度节点中的坐标。
+这些坐标是货架模型中心点。调度器从 `agv_scheduler/config/warehouse_layout.yaml` 读取同一套中心点，并额外维护 AGV 实际导航使用的 `pickup` 停靠点。修改 world 布局后，需要同步该布局配置文件。
 
 ## 使用方式
 

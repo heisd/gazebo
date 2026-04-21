@@ -1,0 +1,54 @@
+warehouse_layout:
+  shelves:
+    A1:
+      center: [-9.0, 7.0]
+      pickup: [-8.1, 7.0]
+    A2:
+      center: [-5.0, 7.0]
+      pickup: [-4.1, 7.0]
+    A3:
+      center: [-1.0, 7.0]
+      pickup: [-0.1, 7.0]
+    A4:
+      center: [3.0, 7.0]
+      pickup: [3.9, 7.0]
+    B1:
+      center: [-9.0, 3.0]
+      pickup: [-8.1, 3.0]
+    B2:
+      center: [-5.0, 3.0]
+      pickup: [-4.1, 3.0]
+    B3:
+      center: [-1.0, 3.0]
+      pickup: [-0.1, 3.0]
+    B4:
+      center: [3.0, 3.0]
+      pickup: [3.9, 3.0]
+    C1:
+      center: [-9.0, -3.0]
+      pickup: [-8.1, -3.0]
+    C2:
+      center: [-5.0, -3.0]
+      pickup: [-4.1, -3.0]
+    C3:
+      center: [-1.0, -3.0]
+      pickup: [-0.1, -3.0]
+    C4:
+      center: [3.0, -3.0]
+      pickup: [3.9, -3.0]
+    D1:
+      center: [-9.0, -7.0]
+      pickup: [-8.1, -7.0]
+    D2:
+      center: [-5.0, -7.0]
+      pickup: [-4.1, -7.0]
+    D3:
+      center: [-1.0, -7.0]
+      pickup: [-0.1, -7.0]
+    D4:
+      center: [3.0, -7.0]
+      pickup: [3.9, -7.0]
+  station:
+    center: [9.0, 0.0]
+  charging:
+    center: [9.0, -8.0]

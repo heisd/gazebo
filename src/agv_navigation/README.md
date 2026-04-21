@@ -11,6 +11,7 @@
 | `launch/mapping.launch.py` | 在线建图入口，启动 `slam_toolbox` 和 `map_saver_server` |
 | `launch/navigation.launch.py` | 仅启动 Nav2 navigation stack，适合在线 SLAM 同时运行时调试 |
 | `launch/localization_navigation.launch.py` | 正式导航入口，加载保存地图，启动 AMCL + Nav2 |
+| `launch/two_agv_localization_navigation.launch.py` | 两车导航入口，为 `agv_01`、`agv_02` 各启动一套带 frame 前缀的 AMCL + Nav2 |
 
 ## 在信息流中的位置
 
@@ -139,6 +140,44 @@ ros2 run tf2_ros tf2_echo map base_footprint
 ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
   "{pose: {header: {frame_id: 'map'}, pose: {position: {x: 2.0, y: 0.0, z: 0.0}, orientation: {w: 1.0}}}}"
 ```
+
+### 两车导航
+
+先启动两车仿真底座：
+
+```bash
+ros2 launch agv_bringup two_agv_sim.launch.py gui:=false rviz:=false
+```
+
+再启动两车定位和导航：
+
+```bash
+ros2 launch agv_navigation two_agv_localization_navigation.launch.py \
+  map:=$(pwd)/src/agv_navigation/maps/warehouse.yaml
+```
+
+这个启动文件会从单车 `nav2_params.yaml` 自动生成两份运行时参数，把 Nav2 的 frame 和话题改成：
+
+```text
+agv_01_odom / agv_01_base_footprint / /agv_01/scan / /agv_01/cmd_vel
+agv_02_odom / agv_02_base_footprint / /agv_02/scan / /agv_02/cmd_vel
+```
+
+对应 action server 为：
+
+```text
+/agv_01/navigate_to_pose
+/agv_02/navigate_to_pose
+```
+
+检查两车定位 TF：
+
+```bash
+ros2 run tf2_ros tf2_echo map agv_01_base_footprint
+ros2 run tf2_ros tf2_echo map agv_02_base_footprint
+```
+
+`map` frame 由 AMCL 发布。AMCL 需要先完成 lifecycle 激活并收到第一帧激光，因此 `tf2_echo` 刚启动时可能先打印 `Invalid frame ID "map"`。如果随后能持续输出矩阵，TF 链路就是可用的。
 
 检查配置是否已安装：
 

@@ -8,6 +8,7 @@
 | --- | --- |
 | `launch/agv_full.launch.py` | 完整 AGV 仓储系统启动文件 |
 | `launch/agv_sim.launch.py` | 仅启动仿真底座，用于建图和正式导航前的 Gazebo/机器人/控制器准备 |
+| `launch/two_agv_sim.launch.py` | 启动两台相同 AGV 模型，并用不同 namespace/topic 区分 |
 
 ## 启动顺序
 
@@ -37,6 +38,19 @@
 | 12s | `joint_state_broadcaster` | `ros2_control` |
 | 14s | `diff_drive_controller` | `ros2_control` |
 | 16s | `rviz2` | RViz |
+
+`two_agv_sim.launch.py` 启动两台相同模型的 AGV：
+
+| 时间 | 组件 | 说明 |
+| --- | --- | --- |
+| 0s | `gzserver` + `warehouse.world` | 仓库仿真世界 |
+| 0s | `gzclient` | 默认启动，可用 `gui:=false` 关闭 |
+| 0s | 两个 `robot_state_publisher` | 分别在 `/agv_01` 和 `/agv_02` 下运行 |
+| 0s | 两个 `joint_state_publisher` | 分别发布两台车的轮关节状态 |
+| 3s | `spawn_entity.py` 生成两台 AGV | 实体名分别为 `agv_01`、`agv_02` |
+| 10s | `rviz2` | 默认启动，可用 `rviz:=false` 关闭 |
+
+两车仿真模式先使用 `gazebo_ros_diff_drive` 插件直接处理底盘速度和里程计，不启动 `ros2_control` spawner，避免两台车争用同一个 `/controller_manager`。
 
 ## 在信息流中的位置
 
@@ -75,6 +89,44 @@ ros2 launch agv_bringup agv_full.launch.py
 ros2 launch agv_bringup agv_sim.launch.py
 ```
 
+启动两车仿真底座：
+
+```bash
+ros2 launch agv_bringup two_agv_sim.launch.py
+```
+
+无桌面或只需要后台仿真时关闭 Gazebo GUI 和 RViz：
+
+```bash
+ros2 launch agv_bringup two_agv_sim.launch.py gui:=false rviz:=false
+```
+
+启动后检查两车话题：
+
+```bash
+ros2 topic list | grep agv_
+```
+
+应看到类似：
+
+```text
+/agv_01/cmd_vel
+/agv_01/odom
+/agv_01/scan
+/agv_02/cmd_vel
+/agv_02/odom
+/agv_02/scan
+```
+
+检查两车 TF：
+
+```bash
+ros2 run tf2_ros tf2_echo agv_01_odom agv_01_base_footprint
+ros2 run tf2_ros tf2_echo agv_02_odom agv_02_base_footprint
+```
+
+`tf2_echo` 在 Gazebo 实体生成前可能先打印 `Invalid frame ID`，这是 TF buffer 等待首帧变换的正常现象；若 10 秒后仍持续出现，先确认 `ros2 node list` 中还有 `/agv_01/robot_state_publisher`、`/agv_02/robot_state_publisher` 和 Gazebo diff drive 插件节点。
+
 显式传入仿真时间参数：
 
 ```bash
@@ -102,3 +154,4 @@ ros2 topic echo /agv/odom
 - 当前会先启动 `slam_toolbox`，再启动 Nav2 navigation stack；`navigate_to_pose` action 由 Nav2 提供。
 - URDF 中的 `lidar_link` 已包含 Gazebo ray laser 插件，`slam_toolbox` 通过 `/scan -> /agv/scan` 重映射读取雷达数据。
 - 控制器加载依赖 Gazebo 内部 `/controller_manager` 初始化完成，因此启动文件用定时延迟。机器较慢时可适当增加 12s 和 14s 两个加载延迟。
+- 两车模式只完成仿真底座和话题/TF 隔离；Nav2 多车导航还需要为 `/agv_01/navigate_to_pose` 和 `/agv_02/navigate_to_pose` 各启动一套 Nav2。
