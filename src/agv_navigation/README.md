@@ -156,6 +156,17 @@ ros2 launch agv_navigation two_agv_localization_navigation.launch.py \
   map:=$(pwd)/src/agv_navigation/maps/warehouse.yaml
 ```
 
+两车仿真默认使用 `localization_mode:=odom`，启动文件会发布固定的
+`map -> agv_01_odom` 和 `map -> agv_02_odom`，让 Nav2 的 `map` 坐标和
+Gazebo/odom 坐标保持一致。这样适合当前确定性仿真，避免 AMCL 在对称货架
+环境里粒子发散导致小车抖动。需要测试粒子滤波定位时可以显式切换：
+
+```bash
+ros2 launch agv_navigation two_agv_localization_navigation.launch.py \
+  localization_mode:=amcl \
+  map:=$(pwd)/src/agv_navigation/maps/warehouse.yaml
+```
+
 这个启动文件会从单车 `nav2_params.yaml` 自动生成两份运行时参数，把 Nav2 的 frame 和话题改成：
 
 ```text
@@ -177,7 +188,10 @@ ros2 run tf2_ros tf2_echo map agv_01_base_footprint
 ros2 run tf2_ros tf2_echo map agv_02_base_footprint
 ```
 
-`map` frame 由 AMCL 发布。AMCL 需要先完成 lifecycle 激活并收到第一帧激光，因此 `tf2_echo` 刚启动时可能先打印 `Invalid frame ID "map"`。如果随后能持续输出矩阵，TF 链路就是可用的。
+`localization_mode:=odom` 时，`map` 到每台车 odom 的变换是固定发布的。
+`localization_mode:=amcl` 时，`map` frame 由 AMCL 发布；AMCL 需要先完成
+lifecycle 激活并收到第一帧激光，因此 `tf2_echo` 刚启动时可能先打印
+`Invalid frame ID "map"`。如果随后能持续输出矩阵，TF 链路就是可用的。
 
 检查配置是否已安装：
 

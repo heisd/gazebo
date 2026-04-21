@@ -50,22 +50,27 @@ Nav2 / 底盘控制链路
 
 ## 仓库布局配置
 
-调度器从 `config/warehouse_layout.yaml` 读取业务坐标。每个货架有两套坐标：
+调度器从 `config/warehouse_layout.yaml` 读取业务坐标。每个货架有货架中心、
+取货停靠点和停靠朝向：
 
 | 字段 | 含义 |
 | --- | --- |
 | `center` | Gazebo world 中货架模型中心，用于业务记录和显示 |
 | `pickup` | AGV 实际导航到的取货停靠点，避开货架碰撞体 |
+| `pickup_yaw` | AGV 到达取货点后的车头朝向，单位是弧度，`0.0` 表示朝地图 `+x` 方向 |
 
 例如：
 
 ```yaml
 A1:
   center: [-9.0, 7.0]
-  pickup: [-8.1, 7.0]
+  pickup: [-9.0, 5.4]
+  pickup_yaw: 0.0
 ```
 
-收到 `{"shelf":"A1"}` 后，调度器会记录货架中心 `(-9.0, 7.0)`，但发送给 Nav2 的目标点是停靠点 `(-8.1, 7.0)`。
+收到 `{"shelf":"A1"}` 后，调度器会记录货架中心 `(-9.0, 7.0)`，但发送给 Nav2 的目标点是停靠点 `(-9.0, 5.4)`。
+`pickup_yaw: 0.0` 会让车头按图示方向朝右停好。如果更习惯角度，也可以
+写 `pickup_yaw_deg: 90.0`，调度器会自动换算成弧度。
 
 ## 订阅接口
 
@@ -79,7 +84,7 @@ A1:
 
 | Topic / Action | 类型 | 说明 |
 | --- | --- | --- |
-| `/agv/task_assigned` | `std_msgs/msg/String` | 任务分配结果，包含 AGV、任务号、货架中心、取货停靠点和投放点 |
+| `/agv/task_assigned` | `std_msgs/msg/String` | 任务分配结果，包含 AGV、任务号、货架中心、取货停靠点、取货朝向和投放点 |
 | `/agv/scheduler_status` | `std_msgs/msg/String` | 调度器周期状态，包含待处理数、完成数、车队状态 |
 | `/agv/cmd_vel` 或参数指定的 cmd_vel topic | `geometry_msgs/msg/Twist` | 安全停车时发布零速度 |
 | `navigate_to_pose` 或参数指定的 action | `nav2_msgs/action/NavigateToPose` | 向对应车辆的 Nav2 发送目标点 |

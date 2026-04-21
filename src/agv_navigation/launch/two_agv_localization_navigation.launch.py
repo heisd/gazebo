@@ -76,9 +76,12 @@ def _write_robot_params(base_params, robot_id, initial_x, initial_y,
     return path
 
 
-def _nav2_nodes(robot_id, params_file, use_sim_time, autostart):
+def _nav2_nodes(robot_id, params_file, use_sim_time, autostart,
+                localization_mode):
     tf_remaps = [("/tf", "/tf"), ("/tf_static", "/tf_static")]
-    lifecycle_localization = ["map_server", "amcl"]
+    use_amcl = localization_mode == "amcl"
+    lifecycle_localization = ["map_server", "amcl"] if use_amcl else [
+        "map_server"]
     lifecycle_navigation = [
         "controller_server",
         "smoother_server",
@@ -95,18 +98,11 @@ def _nav2_nodes(robot_id, params_file, use_sim_time, autostart):
         "output": "screen",
     }
 
-    return [
+    nodes = [
         Node(
             package="nav2_map_server",
             executable="map_server",
             name="map_server",
-            remappings=tf_remaps,
-            **common,
-        ),
-        Node(
-            package="nav2_amcl",
-            executable="amcl",
-            name="amcl",
             remappings=tf_remaps,
             **common,
         ),
@@ -122,6 +118,30 @@ def _nav2_nodes(robot_id, params_file, use_sim_time, autostart):
                 "node_names": lifecycle_localization,
             }],
         ),
+    ]
+
+    if use_amcl:
+        nodes.insert(1, Node(
+            package="nav2_amcl",
+            executable="amcl",
+            name="amcl",
+            remappings=tf_remaps,
+            **common,
+        ))
+    else:
+        nodes.insert(1, Node(
+            package="tf2_ros",
+            executable="static_transform_publisher",
+            name="map_to_odom_broadcaster",
+            namespace=robot_id,
+            arguments=[
+                "0", "0", "0", "0", "0", "0",
+                "map", f"{robot_id}_odom",
+            ],
+            output="screen",
+        ))
+
+    nodes.extend([
         Node(
             package="nav2_controller",
             executable="controller_server",
@@ -186,7 +206,8 @@ def _nav2_nodes(robot_id, params_file, use_sim_time, autostart):
                 "node_names": lifecycle_navigation,
             }],
         ),
-    ]
+    ])
+    return nodes
 
 
 def _launch_setup(context, *args, **kwargs):
@@ -195,6 +216,12 @@ def _launch_setup(context, *args, **kwargs):
     use_sim_time = _as_bool(
         LaunchConfiguration("use_sim_time").perform(context))
     autostart = _as_bool(LaunchConfiguration("autostart").perform(context))
+    localization_mode = LaunchConfiguration("localization_mode").perform(
+        context)
+    if localization_mode not in ("odom", "amcl"):
+        raise ValueError(
+            "localization_mode must be 'odom' or 'amcl', "
+            f"got {localization_mode!r}")
 
     with open(params_file, "r") as stream:
         base_params = yaml.safe_load(stream)
@@ -205,7 +232,8 @@ def _launch_setup(context, *args, **kwargs):
             base_params, robot_id, initial_x, initial_y,
             map_file, use_sim_time)
         actions.extend(
-            _nav2_nodes(robot_id, robot_params, use_sim_time, autostart))
+            _nav2_nodes(robot_id, robot_params, use_sim_time, autostart,
+                        localization_mode))
     return actions
 
 
@@ -218,6 +246,12 @@ def generate_launch_description():
         SetEnvironmentVariable("RCUTILS_LOGGING_BUFFERED_STREAM", "1"),
         DeclareLaunchArgument("use_sim_time", default_value="true"),
         DeclareLaunchArgument("autostart", default_value="true"),
+        DeclareLaunchArgument(
+            "localization_mode",
+            default_value="odom",
+            description="Use 'odom' for deterministic simulation or 'amcl' "
+                        "for particle-filter localization.",
+        ),
         DeclareLaunchArgument("params_file", default_value=default_params),
         DeclareLaunchArgument("map", default_value=default_map),
         OpaqueFunction(function=_launch_setup),

@@ -43,6 +43,7 @@ class Task:
     shelf: str
     shelf_center_xy: Tuple[float, float]
     pick_xy: Tuple[float, float]
+    pick_yaw: float
     drop_xy: Tuple[float, float]
     priority: int = 1
     ts: float = field(default_factory=time.time)
@@ -85,27 +86,28 @@ class RouteReservation:
 class ShelfLocation:
     center_xy: Tuple[float, float]
     pick_xy: Tuple[float, float]
+    pick_yaw: float = 0.0
 
 
 class AGVScheduler(Node):
 
     DEFAULT_SHELVES = {
-        "A1": ShelfLocation((-9.0, 7.0), (-8.1, 7.0)),
-        "A2": ShelfLocation((-5.0, 7.0), (-4.1, 7.0)),
-        "A3": ShelfLocation((-1.0, 7.0), (-0.1, 7.0)),
-        "A4": ShelfLocation((3.0, 7.0), (3.9, 7.0)),
-        "B1": ShelfLocation((-9.0, 3.0), (-8.1, 3.0)),
-        "B2": ShelfLocation((-5.0, 3.0), (-4.1, 3.0)),
-        "B3": ShelfLocation((-1.0, 3.0), (-0.1, 3.0)),
-        "B4": ShelfLocation((3.0, 3.0), (3.9, 3.0)),
-        "C1": ShelfLocation((-9.0, -3.0), (-8.1, -3.0)),
-        "C2": ShelfLocation((-5.0, -3.0), (-4.1, -3.0)),
-        "C3": ShelfLocation((-1.0, -3.0), (-0.1, -3.0)),
-        "C4": ShelfLocation((3.0, -3.0), (3.9, -3.0)),
-        "D1": ShelfLocation((-9.0, -7.0), (-8.1, -7.0)),
-        "D2": ShelfLocation((-5.0, -7.0), (-4.1, -7.0)),
-        "D3": ShelfLocation((-1.0, -7.0), (-0.1, -7.0)),
-        "D4": ShelfLocation((3.0, -7.0), (3.9, -7.0)),
+        "A1": ShelfLocation((-9.0, 7.0), (-9.0, 5.4), 0.0),
+        "A2": ShelfLocation((-5.0, 7.0), (-5.0, 5.4), 0.0),
+        "A3": ShelfLocation((-1.0, 7.0), (-1.0, 5.4), 0.0),
+        "A4": ShelfLocation((3.0, 7.0), (3.0, 5.4), 0.0),
+        "B1": ShelfLocation((-9.0, 3.0), (-9.0, 1.4), 0.0),
+        "B2": ShelfLocation((-5.0, 3.0), (-5.0, 1.4), 0.0),
+        "B3": ShelfLocation((-1.0, 3.0), (-1.0, 1.4), 0.0),
+        "B4": ShelfLocation((3.0, 3.0), (3.0, 1.4), 0.0),
+        "C1": ShelfLocation((-9.0, -3.0), (-9.0, -1.4), 0.0),
+        "C2": ShelfLocation((-5.0, -3.0), (-5.0, -1.4), 0.0),
+        "C3": ShelfLocation((-1.0, -3.0), (-1.0, -1.4), 0.0),
+        "C4": ShelfLocation((3.0, -3.0), (3.0, -1.4), 0.0),
+        "D1": ShelfLocation((-9.0, -7.0), (-9.0, -5.4), 0.0),
+        "D2": ShelfLocation((-5.0, -7.0), (-5.0, -5.4), 0.0),
+        "D3": ShelfLocation((-1.0, -7.0), (-1.0, -5.4), 0.0),
+        "D4": ShelfLocation((3.0, -7.0), (3.0, -5.4), 0.0),
     }
     DEFAULT_STATION = (9.0, 0.0)
     DEFAULT_CHARGING = (9.0, -8.0)
@@ -231,7 +233,9 @@ class AGVScheduler(Node):
                                           f"{shelf_id}.center")
             pickup = self._xy_from_config(raw.get("pickup"),
                                           f"{shelf_id}.pickup")
-            shelves[str(shelf_id)] = ShelfLocation(center, pickup)
+            pickup_yaw = self._yaw_from_config(raw, f"{shelf_id}.pickup_yaw")
+            shelves[str(shelf_id)] = ShelfLocation(
+                center, pickup, pickup_yaw)
 
         station = self._xy_from_config(
             layout.get("station", {}).get("center"), "station.center")
@@ -245,6 +249,13 @@ class AGVScheduler(Node):
         if not isinstance(value, (list, tuple)) or len(value) != 2:
             raise ValueError(f"{name} must be a two-item [x, y] list")
         return (float(value[0]), float(value[1]))
+
+    def _yaw_from_config(self, raw: dict, name: str) -> float:
+        if "pickup_yaw" in raw:
+            return float(raw["pickup_yaw"])
+        if "pickup_yaw_deg" in raw:
+            return math.radians(float(raw["pickup_yaw_deg"]))
+        return 0.0
 
     def _string_list_param(self, name: str, default: List[str]) -> List[str]:
         value = self.get_parameter(name).value
@@ -315,6 +326,7 @@ class AGVScheduler(Node):
                 shelf=shelf,
                 shelf_center_xy=shelf_location.center_xy,
                 pick_xy=shelf_location.pick_xy,
+                pick_yaw=shelf_location.pick_yaw,
                 drop_xy=self.station_xy,
                 priority=int(data.get("priority", 1)),
                 requested_agv=data.get("agv_id", data.get("agv", "")),
@@ -372,9 +384,10 @@ class AGVScheduler(Node):
             f"[ASSIGN] {task.tid} -> {aid} shelf={task.shelf} "
             f"center=({task.shelf_center_xy[0]:.1f},"
             f"{task.shelf_center_xy[1]:.1f}) "
-            f"pickup=({task.pick_xy[0]:.1f},{task.pick_xy[1]:.1f})")
+            f"pickup=({task.pick_xy[0]:.1f},{task.pick_xy[1]:.1f},"
+            f"yaw={task.pick_yaw:.2f})")
         self._pub_assign(agv, task)
-        if not self._send_nav(task.pick_xy, task, agv):
+        if not self._send_nav(task.pick_xy, task.pick_yaw, task, agv):
             self._return_task_to_queue(agv, task, "Nav2 server not ready")
             return
         with self.lock:
@@ -441,6 +454,7 @@ class AGVScheduler(Node):
     def _send_nav(
             self,
             xy: Tuple[float, float],
+            yaw: float,
             task: Task,
             agv: AGVState) -> bool:
         client = self.nav_clients[agv.aid]
@@ -454,12 +468,14 @@ class AGVScheduler(Node):
         goal.pose.header.stamp = self.get_clock().now().to_msg()
         goal.pose.pose.position.x = float(xy[0])
         goal.pose.pose.position.y = float(xy[1])
-        goal.pose.pose.orientation.w = 1.0
+        goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
         future = client.send_goal_async(goal)
         future.add_done_callback(lambda f: self._nav_accepted(f, task, agv))
         self.get_logger().info(
-            f"[Nav2] {agv.aid} goal=({xy[0]:.1f},{xy[1]:.1f}) "
+            f"[Nav2] {agv.aid} goal=({xy[0]:.1f},{xy[1]:.1f},"
+            f"yaw={yaw:.2f}) "
             f"via {agv.nav_action}")
         return True
 
@@ -514,7 +530,7 @@ class AGVScheduler(Node):
         self.get_logger().info(
             f"[ARRIVE] {agv.aid} reached shelf {task.shelf}, "
             "heading to station")
-        if not self._send_nav(next_xy, task, agv):
+        if not self._send_nav(next_xy, 0.0, task, agv):
             self._return_task_to_queue(
                 agv, task, "station navigation unavailable")
 
@@ -594,6 +610,7 @@ class AGVScheduler(Node):
             "shelf": task.shelf,
             "shelf_center": list(task.shelf_center_xy),
             "pick": list(task.pick_xy),
+            "pick_yaw": task.pick_yaw,
             "drop": list(task.drop_xy),
             "priority": task.priority,
             "nav_action": agv.nav_action,
