@@ -72,6 +72,61 @@
       ]
     }
   },
-  "hotPaths": [],
+  "hotPaths": [
+    {
+      "path": "analysis.md",
+      "accessCount": 1,
+      "lastAccessed": 1776830511841,
+      "type": "file"
+    },
+    {
+      "path": "src/README.md",
+      "accessCount": 1,
+      "lastAccessed": 1776830511968,
+      "type": "file"
+    },
+    {
+      "path": "src/agv_scheduler/README.md",
+      "accessCount": 1,
+      "lastAccessed": 1776830520580,
+      "type": "file"
+    },
+    {
+      "path": "src/agv_bringup/README.md",
+      "accessCount": 1,
+      "lastAccessed": 1776830520616,
+      "type": "file"
+    },
+    {
+      "path": "src/agv_navigation/README.md",
+      "accessCount": 1,
+      "lastAccessed": 1776830520744,
+      "type": "file"
+    },
+    {
+      "path": "src/agv_description/README.md",
+      "accessCount": 1,
+      "lastAccessed": 1776830528876,
+      "type": "file"
+    },
+    {
+      "path": "src/agv_gazebo/README.md",
+      "accessCount": 1,
+      "lastAccessed": 1776830528956,
+      "type": "file"
+    },
+    {
+      "path": "src/agv_scheduler/package.xml",
+      "accessCount": 1,
+      "lastAccessed": 1776830535468,
+      "type": "file"
+    },
+    {
+      "path": "CLAUDE.md",
+      "accessCount": 1,
+      "lastAccessed": 1776830629923,
+      "type": "file"
+    }
+  ],
   "userDirectives": []
 }
