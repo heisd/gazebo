@@ -13,7 +13,12 @@ from launch_ros.actions import Node
 def get_robot_description():
     desc_dir = get_package_share_directory('agv_description')
     urdf = os.path.join(desc_dir, 'urdf', 'agv_robot.urdf.xacro')
-    result = subprocess.run(['xacro', urdf], capture_output=True, text=True)
+    result = subprocess.run(
+        ['xacro', urdf, 'enable_ros2_control:=false'],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     return result.stdout
 
 
@@ -52,22 +57,6 @@ def generate_launch_description():
                    '-x', '0.0', '-y', '0.0', '-z', '0.12'],
         output='screen')
 
-    load_jsb = Node(
-        package='controller_manager',
-        executable='spawner',
-        arguments=['joint_state_broadcaster',
-                   '--controller-manager', '/controller_manager',
-                   '--controller-manager-timeout', '60'],
-        output='screen')
-
-    load_ddc = Node(
-        package='controller_manager',
-        executable='spawner',
-        arguments=['diff_drive_controller',
-                   '--controller-manager', '/controller_manager',
-                   '--controller-manager-timeout', '60'],
-        output='screen')
-
     rviz = Node(
         package='rviz2',
         executable='rviz2',
@@ -81,7 +70,5 @@ def generate_launch_description():
         TimerAction(period=5.0, actions=[rsp]),
         TimerAction(period=5.5, actions=[jsp]),
         TimerAction(period=7.0, actions=[spawn]),
-        TimerAction(period=12.0, actions=[load_jsb]),
-        TimerAction(period=14.0, actions=[load_ddc]),
-        TimerAction(period=16.0, actions=[rviz]),
+        TimerAction(period=12.0, actions=[rviz]),
     ])

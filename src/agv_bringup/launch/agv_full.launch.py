@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AGV 仓储系统完整启动文件 (Humble 最终修正版)
-解决 ros2_control_node 插件冲突及控制器激活失败问题
+默认使用 Gazebo diff-drive 插件，避免 ros2_control 与 Gazebo 底盘插件争用。
 """
 import os, subprocess
 from ament_index_python.packages import get_package_share_directory
@@ -17,7 +17,12 @@ def get_robot_description():
     desc_dir = get_package_share_directory('agv_description')
     urdf = os.path.join(desc_dir, 'urdf', 'agv_robot.urdf.xacro')
     # 使用 subprocess 解析 xacro
-    result = subprocess.run(['xacro', urdf], capture_output=True, text=True)
+    result = subprocess.run(
+        ['xacro', urdf, 'enable_ros2_control:=false'],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     return result.stdout
 
 def generate_launch_description():
@@ -64,28 +69,7 @@ def generate_launch_description():
                    '-x', '0.0', '-y', '0.0', '-z', '0.12'],
         output='screen')
 
-    # --- 注意：移除了独立的 ros2_control_node，由 Gazebo 插件 libgazebo_ros2_control 接管 ---
-
-    # 4. 加载 joint_state_broadcaster
-    # spawner 会等待 /controller_manager 就绪，避免一次性 ros2 control 命令过早执行后失败。
-    load_jsb = Node(
-        package='controller_manager',
-        executable='spawner',
-        arguments=['joint_state_broadcaster',
-                   '--controller-manager', '/controller_manager',
-                   '--controller-manager-timeout', '60'],
-        output='screen')
-
-    # 5. 加载 diff_drive_controller
-    load_ddc = Node(
-        package='controller_manager',
-        executable='spawner',
-        arguments=['diff_drive_controller',
-                   '--controller-manager', '/controller_manager',
-                   '--controller-manager-timeout', '60'],
-        output='screen')
-
-    # 6. SLAM 建图 (异步 SLAM)
+    # 4. SLAM 建图 (异步 SLAM)
     slam_params = [nav_cfg, {'use_sim_time': use_sim}] if os.path.exists(nav_cfg) else [{'use_sim_time': use_sim}]
     slam = Node(
         package='slam_toolbox',
@@ -95,7 +79,7 @@ def generate_launch_description():
         remappings=[('/scan', '/agv/scan')],
         output='screen')
 
-    # 7. Nav2 导航栈
+    # 5. Nav2 导航栈
     nav2 = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(nav_launch),
         launch_arguments={
@@ -104,7 +88,7 @@ def generate_launch_description():
             'autostart': 'true',
         }.items())
 
-    # 8. AGV 调度节点
+    # 6. AGV 调度节点
     scheduler = Node(
         package='agv_scheduler',
         executable='scheduler_node',
@@ -112,7 +96,7 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim}],
         output='screen')
 
-    # 9. RViz2 (可视化)
+    # 7. RViz2 (可视化)
     rviz = Node(
         package='rviz2', executable='rviz2',
         name='rviz2', output='screen')
@@ -125,11 +109,8 @@ def generate_launch_description():
         TimerAction(period=5.0,  actions=[rsp]),
         TimerAction(period=5.5,  actions=[jsp]),
         TimerAction(period=7.0,  actions=[spawn]),
-        # 给 Gazebo 插件初始化的时间，适当延长等待
-        TimerAction(period=12.0, actions=[load_jsb]),
-        TimerAction(period=14.0, actions=[load_ddc]),
-        TimerAction(period=16.0, actions=[slam]),
-        TimerAction(period=20.0, actions=[nav2]),
-        TimerAction(period=24.0, actions=[scheduler]),
-        TimerAction(period=26.0, actions=[rviz]),
+        TimerAction(period=12.0, actions=[slam]),
+        TimerAction(period=16.0, actions=[nav2]),
+        TimerAction(period=20.0, actions=[scheduler]),
+        TimerAction(period=22.0, actions=[rviz]),
     ])

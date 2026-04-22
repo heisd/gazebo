@@ -129,7 +129,7 @@ controller_server:
     use_sim_time: true
     controller_frequency: 15.0
     min_x_velocity_threshold: 0.001
-    min_y_velocity_threshold: 0.5
+    min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
     failure_tolerance: 0.3
     progress_checker_plugin: progress_checker
@@ -144,26 +144,26 @@ controller_server:
     general_goal_checker:
       stateful: true
       plugin: nav2_controller::SimpleGoalChecker
-      xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.12
+      xy_goal_tolerance: 0.20
+      yaw_goal_tolerance: 6.28
 
     FollowPath:
       plugin: dwb_core::DWBLocalPlanner
       debug_trajectory_details: false
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 0.35
+      max_vel_x: 0.25
       max_vel_y: 0.0
-      max_vel_theta: 0.9
+      max_vel_theta: 0.7
       min_speed_xy: 0.0
-      max_speed_xy: 0.35
+      max_speed_xy: 0.25
       min_speed_theta: 0.0
-      acc_lim_x: 0.8
+      acc_lim_x: 0.5
       acc_lim_y: 0.0
-      acc_lim_theta: 1.5
-      decel_lim_x: -0.8
+      acc_lim_theta: 1.0
+      decel_lim_x: -0.5
       decel_lim_y: 0.0
-      decel_lim_theta: -1.5
+      decel_lim_theta: -1.0
       vx_samples: 20
       vy_samples: 1
       vtheta_samples: 20
@@ -171,12 +171,12 @@ controller_server:
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.3
-      xy_goal_tolerance: 0.25
+      xy_goal_tolerance: 0.20
       trans_stopped_velocity: 0.05
       short_circuit_trajectory_evaluation: true
       stateful: true
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      BaseObstacle.scale: 0.02
+      BaseObstacle.scale: 0.12
       PathAlign.scale: 24.0
       PathAlign.forward_point_distance: 0.15
       GoalAlign.scale: 18.0
@@ -199,7 +199,7 @@ local_costmap:
       width: 4
       height: 4
       resolution: 0.05
-      footprint: "[[0.36, 0.28], [0.36, -0.28], [-0.36, -0.28], [-0.36, 0.28]]"
+      footprint: "[[0.42, 0.36], [0.42, -0.36], [-0.42, -0.36], [-0.42, 0.36]]"
       plugins: ["obstacle_layer", "inflation_layer"]
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
@@ -218,7 +218,7 @@ local_costmap:
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         cost_scaling_factor: 4.0
-        inflation_radius: 0.45
+        inflation_radius: 0.30
       always_send_full_costmap: true
 
 global_costmap:
@@ -231,7 +231,7 @@ global_costmap:
       use_sim_time: true
       resolution: 0.05
       track_unknown_space: true
-      footprint: "[[0.36, 0.28], [0.36, -0.28], [-0.36, -0.28], [-0.36, 0.28]]"
+      footprint: "[[0.42, 0.36], [0.42, -0.36], [-0.42, -0.36], [-0.42, 0.36]]"
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
@@ -253,7 +253,7 @@ global_costmap:
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         cost_scaling_factor: 4.0
-        inflation_radius: 0.45
+        inflation_radius: 0.30
       always_send_full_costmap: true
 
 planner_server:
@@ -263,9 +263,9 @@ planner_server:
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: nav2_navfn_planner/NavfnPlanner
-      tolerance: 0.5
-      use_astar: false
-      allow_unknown: true
+      tolerance: 0.1
+      use_astar: true
+      allow_unknown: false
 
 smoother_server:
   ros__parameters:
@@ -319,10 +319,10 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: OPEN_LOOP
-    max_velocity: [0.35, 0.0, 0.9]
-    min_velocity: [-0.15, 0.0, -0.9]
-    max_accel: [0.8, 0.0, 1.5]
-    max_decel: [-0.8, 0.0, -1.5]
+    max_velocity: [0.25, 0.0, 0.7]
+    min_velocity: [-0.10, 0.0, -0.7]
+    max_accel: [0.5, 0.0, 1.0]
+    max_decel: [-0.5, 0.0, -1.0]
     odom_topic: /agv/odom
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]

@@ -22,12 +22,12 @@ agv_description
   |
   +--> ros2_controllers.yaml
          |
-         +--> Gazebo 内的 /controller_manager
-         +--> joint_state_broadcaster
-         +--> diff_drive_controller
+         +--> 可选的 Gazebo 内 /controller_manager
+         +--> 可选的 joint_state_broadcaster
+         +--> 可选的 diff_drive_controller
 ```
 
-这个包不直接处理任务，也不做路径规划。它给 `agv_bringup` 提供 Xacro 文件，由 `robot_state_publisher` 发布坐标树，并由 Gazebo 插件加载控制器配置。
+这个包不直接处理任务，也不做路径规划。它给 `agv_bringup` 提供 Xacro 文件，由 `robot_state_publisher` 发布坐标树；当前仿真默认关闭 `ros2_control`，由 Gazebo diff-drive 插件直接处理底盘速度和里程计。
 
 ## 关键接口
 
@@ -37,7 +37,6 @@ agv_description
 - 输出：`/agv/odom`
 - 输出：`/agv/scan`
 - 输出 TF：`odom -> base_footprint -> base_link`
-- 控制器管理器：`/controller_manager`
 
 同一个 Xacro 支持通过参数生成多台相同模型的车：
 
@@ -52,7 +51,7 @@ xacro src/agv_description/urdf/agv_robot.urdf.xacro \
 | --- | --- | --- |
 | `namespace` | `agv_01` | Gazebo 插件发布/订阅的话题命名空间 |
 | `prefix` | `agv_01_` | link、joint 和 TF frame 前缀 |
-| `enable_ros2_control` | `false` | 两车底座模式关闭 ros2_control，避免 controller manager 冲突 |
+| `enable_ros2_control` | `false` | 仿真底座模式关闭 ros2_control，避免控制链路冲突 |
 
 因此 `agv_01` 会使用：
 
@@ -92,5 +91,5 @@ ros2 launch agv_bringup agv_full.launch.py
 ## 当前注意点
 
 - `lidar_link` 搭载 Gazebo ray laser，输出 `sensor_msgs/msg/LaserScan` 到 `/agv/scan`，frame 默认为 `lidar_link`；多车模式会按 `prefix` 改为 `agv_01_lidar_link`、`agv_02_lidar_link`。
-- URDF 中同时包含 `gazebo_ros2_control` 和 `gazebo_ros_diff_drive` 相关配置；后续如果只走 `ros2_control` 的 `diff_drive_controller`，应统一控制链路，避免两个底盘插件争用同一车辆运动模型。
+- URDF 中同时包含 `gazebo_ros2_control` 和 `gazebo_ros_diff_drive` 相关配置；当前启动文件默认传入 `enable_ros2_control:=false`，只使用 Gazebo diff-drive 插件。后续如果切到 `ros2_control`，应先禁用 `gazebo_ros_diff_drive`。
 - `config/ros2_controllers.yaml` 里的 `wheel_radius` 是 `0.12`，而 Xacro 里的 `wheel_r` 是 `0.10`。如果里程计或速度比例异常，应优先校准这两个参数。

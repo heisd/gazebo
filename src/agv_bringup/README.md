@@ -1,13 +1,13 @@
 # agv_bringup
 
-`agv_bringup` 是系统总启动包，负责把仿真世界、机器人描述、控制器、SLAM、调度节点和 RViz 按时间顺序拉起来。它是信息流里的编排入口。
+`agv_bringup` 是系统总启动包，负责把仿真世界、机器人描述、Gazebo 底盘插件、SLAM、调度节点和 RViz 按时间顺序拉起来。它是信息流里的编排入口。
 
 ## 包内容
 
 | 路径 | 作用 |
 | --- | --- |
 | `launch/agv_full.launch.py` | 完整 AGV 仓储系统启动文件 |
-| `launch/agv_sim.launch.py` | 仅启动仿真底座，用于建图和正式导航前的 Gazebo/机器人/控制器准备 |
+| `launch/agv_sim.launch.py` | 仅启动仿真底座，用于建图和正式导航前的 Gazebo/机器人准备 |
 | `launch/two_agv_sim.launch.py` | 启动两台相同 AGV 模型，并用不同 namespace/topic 区分 |
 
 ## 启动顺序
@@ -20,12 +20,10 @@
 | 5s | `robot_state_publisher` | `agv_description` |
 | 5.5s | `joint_state_publisher` | `agv_description` |
 | 7s | `spawn_entity.py` 生成 AGV | `gazebo_ros` + `agv_description` |
-| 12s | `joint_state_broadcaster` | `ros2_control` |
-| 14s | `diff_drive_controller` | `ros2_control` |
-| 16s | `slam_toolbox` | `agv_navigation` 配置入口 |
-| 20s | Nav2 navigation stack | `agv_navigation` |
-| 24s | `agv_scheduler` | `agv_scheduler` |
-| 26s | `rviz2` | RViz |
+| 12s | `slam_toolbox` | `agv_navigation` 配置入口 |
+| 16s | Nav2 navigation stack | `agv_navigation` |
+| 20s | `agv_scheduler` | `agv_scheduler` |
+| 22s | `rviz2` | RViz |
 
 `agv_sim.launch.py` 只启动底座链路：
 
@@ -35,9 +33,7 @@
 | 5s | `robot_state_publisher` | `agv_description` |
 | 5.5s | `joint_state_publisher` | `agv_description` |
 | 7s | `spawn_entity.py` 生成 AGV | `gazebo_ros` + `agv_description` |
-| 12s | `joint_state_broadcaster` | `ros2_control` |
-| 14s | `diff_drive_controller` | `ros2_control` |
-| 16s | `rviz2` | RViz |
+| 12s | `rviz2` | RViz |
 
 `two_agv_sim.launch.py` 启动两台相同模型的 AGV：
 
@@ -50,7 +46,7 @@
 | 3s | `spawn_entity.py` 生成两台 AGV | 实体名分别为 `agv_01`、`agv_02` |
 | 10s | `rviz2` | 默认启动，可用 `rviz:=false` 关闭 |
 
-两车仿真模式先使用 `gazebo_ros_diff_drive` 插件直接处理底盘速度和里程计，不启动 `ros2_control` spawner，避免两台车争用同一个 `/controller_manager`。
+单车和两车仿真模式都使用 `gazebo_ros_diff_drive` 插件直接处理底盘速度和里程计，不启动 `ros2_control` spawner，避免控制链路争用同一车辆运动模型。
 
 ## 在信息流中的位置
 
@@ -60,7 +56,7 @@ agv_bringup
   +--> agv_gazebo: 启动仓库 world
   +--> agv_description: 展开 robot_description 并生成实体
   +--> joint_state_publisher: 发布 wheel continuous joints 的默认 joint_states
-  +--> ros2_control: 激活轮式控制器
+  +--> gazebo_ros_diff_drive: 处理 cmd_vel、odom 和 odom TF
   +--> agv_navigation: 启动 SLAM 和 Nav2 导航栈
   +--> agv_scheduler: 启动任务调度
   +--> RViz: 可视化

@@ -2,69 +2,70 @@ warehouse_layout:
   shelves:
     A1:
       center: [-9.0, 7.0]
-      pickup: [-9.0, 5.4]
-      pickup_yaw: 0.0
+      pickup: [-9.0, 5.0]
+      pickup_yaw: 1.5708
     A2:
       center: [-5.0, 7.0]
-      pickup: [-5.0, 5.4]
-      pickup_yaw: 0.0
+      pickup: [-5.0, 5.0]
+      pickup_yaw: 1.5708
     A3:
       center: [-1.0, 7.0]
-      pickup: [-1.0, 5.4]
-      pickup_yaw: 0.0
+      pickup: [-1.0, 5.0]
+      pickup_yaw: 1.5708
     A4:
       center: [3.0, 7.0]
-      pickup: [3.0, 5.4]
-      pickup_yaw: 0.0
+      pickup: [3.0, 5.0]
+      pickup_yaw: 1.5708
     B1:
       center: [-9.0, 3.0]
-      pickup: [-9.0, 1.4]
-      pickup_yaw: 0.0
+      pickup: [-9.0, 1.0]
+      pickup_yaw: 1.5708
     B2:
       center: [-5.0, 3.0]
-      pickup: [-5.0, 1.4]
-      pickup_yaw: 0.0
+      pickup: [-5.0, 1.0]
+      pickup_yaw: 1.5708
     B3:
       center: [-1.0, 3.0]
-      pickup: [-1.0, 1.4]
-      pickup_yaw: 0.0
+      pickup: [-1.0, 1.0]
+      pickup_yaw: 1.5708
     B4:
       center: [3.0, 3.0]
-      pickup: [3.0, 1.4]
-      pickup_yaw: 0.0
+      pickup: [3.0, 1.0]
+      pickup_yaw: 1.5708
     C1:
       center: [-9.0, -3.0]
-      pickup: [-9.0, -1.4]
-      pickup_yaw: 0.0
+      pickup: [-9.0, -1.0]
+      pickup_yaw: -1.5708
     C2:
       center: [-5.0, -3.0]
-      pickup: [-5.0, -1.4]
-      pickup_yaw: 0.0
+      pickup: [-5.0, -1.0]
+      pickup_yaw: -1.5708
     C3:
       center: [-1.0, -3.0]
-      pickup: [-1.0, -1.4]
-      pickup_yaw: 0.0
+      pickup: [-1.0, -1.0]
+      pickup_yaw: -1.5708
     C4:
       center: [3.0, -3.0]
-      pickup: [3.0, -1.4]
-      pickup_yaw: 0.0
+      pickup: [3.0, -1.0]
+      pickup_yaw: -1.5708
     D1:
       center: [-9.0, -7.0]
-      pickup: [-9.0, -5.4]
-      pickup_yaw: 0.0
+      pickup: [-9.0, -5.0]
+      pickup_yaw: -1.5708
     D2:
       center: [-5.0, -7.0]
-      pickup: [-5.0, -5.4]
-      pickup_yaw: 0.0
+      pickup: [-5.0, -5.0]
+      pickup_yaw: -1.5708
     D3:
       center: [-1.0, -7.0]
-      pickup: [-1.0, -5.4]
-      pickup_yaw: 0.0
+      pickup: [-1.0, -5.0]
+      pickup_yaw: -1.5708
     D4:
       center: [3.0, -7.0]
-      pickup: [3.0, -5.4]
-      pickup_yaw: 0.0
+      pickup: [3.0, -5.0]
+      pickup_yaw: -1.5708
   station:
     center: [9.0, 0.0]
+    dock: [6.4, 0.0]
   charging:
     center: [9.0, -8.0]

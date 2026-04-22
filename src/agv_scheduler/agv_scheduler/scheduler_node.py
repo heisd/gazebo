@@ -29,6 +29,7 @@ class State(Enum):
     IDLE = "idle"
     TO_SHELF = "to_shelf"
     PICKING = "picking"
+    TO_AISLE_EXIT = "to_aisle_exit"
     TO_STATION = "to_station"
     DELIVERING = "delivering"
     TO_CHARGE = "to_charge"
@@ -44,12 +45,15 @@ class Task:
     shelf_center_xy: Tuple[float, float]
     pick_xy: Tuple[float, float]
     pick_yaw: float
+    aisle_exit_xy: Tuple[float, float]
     drop_xy: Tuple[float, float]
     priority: int = 1
     ts: float = field(default_factory=time.time)
     agv: str = ""
     requested_agv: str = ""
     status: str = "pending"
+    retry_after: float = 0.0
+    last_error: str = ""
 
     def __lt__(self, other):
         return self.priority > other.priority
@@ -72,6 +76,10 @@ class AGVState:
     wz: float = 0.0
     last_odom_ts: float = 0.0
     current_goal_handle: object = None
+    current_goal_xy: Optional[Tuple[float, float]] = None
+    current_goal_yaw: float = 0.0
+    nav_goal_sent_ts: float = 0.0
+    nav_goal_accepted_ts: float = 0.0
 
 
 @dataclass
@@ -92,25 +100,26 @@ class ShelfLocation:
 class AGVScheduler(Node):
 
     DEFAULT_SHELVES = {
-        "A1": ShelfLocation((-9.0, 7.0), (-9.0, 5.4), 0.0),
-        "A2": ShelfLocation((-5.0, 7.0), (-5.0, 5.4), 0.0),
-        "A3": ShelfLocation((-1.0, 7.0), (-1.0, 5.4), 0.0),
-        "A4": ShelfLocation((3.0, 7.0), (3.0, 5.4), 0.0),
-        "B1": ShelfLocation((-9.0, 3.0), (-9.0, 1.4), 0.0),
-        "B2": ShelfLocation((-5.0, 3.0), (-5.0, 1.4), 0.0),
-        "B3": ShelfLocation((-1.0, 3.0), (-1.0, 1.4), 0.0),
-        "B4": ShelfLocation((3.0, 3.0), (3.0, 1.4), 0.0),
-        "C1": ShelfLocation((-9.0, -3.0), (-9.0, -1.4), 0.0),
-        "C2": ShelfLocation((-5.0, -3.0), (-5.0, -1.4), 0.0),
-        "C3": ShelfLocation((-1.0, -3.0), (-1.0, -1.4), 0.0),
-        "C4": ShelfLocation((3.0, -3.0), (3.0, -1.4), 0.0),
-        "D1": ShelfLocation((-9.0, -7.0), (-9.0, -5.4), 0.0),
-        "D2": ShelfLocation((-5.0, -7.0), (-5.0, -5.4), 0.0),
-        "D3": ShelfLocation((-1.0, -7.0), (-1.0, -5.4), 0.0),
-        "D4": ShelfLocation((3.0, -7.0), (3.0, -5.4), 0.0),
+        "A1": ShelfLocation((-9.0, 7.0), (-9.0, 5.0), math.pi / 2),
+        "A2": ShelfLocation((-5.0, 7.0), (-5.0, 5.0), math.pi / 2),
+        "A3": ShelfLocation((-1.0, 7.0), (-1.0, 5.0), math.pi / 2),
+        "A4": ShelfLocation((3.0, 7.0), (3.0, 5.0), math.pi / 2),
+        "B1": ShelfLocation((-9.0, 3.0), (-9.0, 1.0), math.pi / 2),
+        "B2": ShelfLocation((-5.0, 3.0), (-5.0, 1.0), math.pi / 2),
+        "B3": ShelfLocation((-1.0, 3.0), (-1.0, 1.0), math.pi / 2),
+        "B4": ShelfLocation((3.0, 3.0), (3.0, 1.0), math.pi / 2),
+        "C1": ShelfLocation((-9.0, -3.0), (-9.0, -1.0), -math.pi / 2),
+        "C2": ShelfLocation((-5.0, -3.0), (-5.0, -1.0), -math.pi / 2),
+        "C3": ShelfLocation((-1.0, -3.0), (-1.0, -1.0), -math.pi / 2),
+        "C4": ShelfLocation((3.0, -3.0), (3.0, -1.0), -math.pi / 2),
+        "D1": ShelfLocation((-9.0, -7.0), (-9.0, -5.0), -math.pi / 2),
+        "D2": ShelfLocation((-5.0, -7.0), (-5.0, -5.0), -math.pi / 2),
+        "D3": ShelfLocation((-1.0, -7.0), (-1.0, -5.0), -math.pi / 2),
+        "D4": ShelfLocation((3.0, -7.0), (3.0, -5.0), -math.pi / 2),
     }
-    DEFAULT_STATION = (9.0, 0.0)
+    DEFAULT_STATION = (6.4, 0.0)
     DEFAULT_CHARGING = (9.0, -8.0)
+    DEFAULT_AISLE_EXIT_X = 5.5
 
     def __init__(self):
         super().__init__("agv_scheduler")
@@ -180,6 +189,7 @@ class AGVScheduler(Node):
         self.create_timer(1.0, self._sched_loop)
         self.create_timer(0.5, self._pub_status)
         self.create_timer(0.2, self._safety_loop)
+        self.create_timer(1.0, self._nav_watchdog)
         self.create_timer(15.0, self._auto_demo)
 
         self.get_logger().info("=" * 50)
@@ -237,8 +247,10 @@ class AGVScheduler(Node):
             shelves[str(shelf_id)] = ShelfLocation(
                 center, pickup, pickup_yaw)
 
+        raw_station = layout.get("station", {})
         station = self._xy_from_config(
-            layout.get("station", {}).get("center"), "station.center")
+            raw_station.get("dock", raw_station.get("center")),
+            "station.dock")
         charging = self._xy_from_config(
             layout.get("charging", {}).get("center"), "charging.center")
 
@@ -327,6 +339,10 @@ class AGVScheduler(Node):
                 shelf_center_xy=shelf_location.center_xy,
                 pick_xy=shelf_location.pick_xy,
                 pick_yaw=shelf_location.pick_yaw,
+                aisle_exit_xy=(
+                    self.DEFAULT_AISLE_EXIT_X,
+                    shelf_location.pick_xy[1],
+                ),
                 drop_xy=self.station_xy,
                 priority=int(data.get("priority", 1)),
                 requested_agv=data.get("agv_id", data.get("agv", "")),
@@ -352,6 +368,8 @@ class AGVScheduler(Node):
                 return
 
             for task_idx, task in enumerate(list(self.queue)):
+                if task.retry_after > time.time():
+                    continue
                 candidates = [
                     agv for agv in idle
                     if not task.requested_agv or agv.aid == task.requested_agv
@@ -428,7 +446,8 @@ class AGVScheduler(Node):
     def _zones_for_task(self, agv: AGVState, task: Task) -> Set[str]:
         zones: Set[str] = set()
         zones.update(self._segment_zones((agv.x, agv.y), task.pick_xy))
-        zones.update(self._segment_zones(task.pick_xy, task.drop_xy))
+        zones.update(self._segment_zones(task.pick_xy, task.aisle_exit_xy))
+        zones.update(self._segment_zones(task.aisle_exit_xy, task.drop_xy))
         zones.add(f"shelf:{task.shelf}")
         zones.add("dock:station")
         return zones
@@ -471,6 +490,15 @@ class AGVScheduler(Node):
         goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
         goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
+        with self.lock:
+            current = self.agvs.get(agv.aid)
+            if current:
+                current.current_goal_handle = None
+                current.current_goal_xy = xy
+                current.current_goal_yaw = yaw
+                current.nav_goal_sent_ts = time.time()
+                current.nav_goal_accepted_ts = 0.0
+
         future = client.send_goal_async(goal)
         future.add_done_callback(lambda f: self._nav_accepted(f, task, agv))
         self.get_logger().info(
@@ -480,7 +508,17 @@ class AGVScheduler(Node):
         return True
 
     def _nav_accepted(self, future, task: Task, agv: AGVState):
-        goal_handle = future.result()
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self._return_task_to_queue(
+                agv, task, f"goal response failed: {exc}")
+            return
+
+        if goal_handle is None:
+            self._return_task_to_queue(agv, task, "empty goal response")
+            return
+
         if not goal_handle.accepted:
             self.get_logger().warn(
                 f"[Nav2] goal rejected: {task.tid} on {agv.aid}")
@@ -493,6 +531,7 @@ class AGVScheduler(Node):
                 goal_handle.cancel_goal_async()
                 return
             current.current_goal_handle = goal_handle
+            current.nav_goal_accepted_ts = time.time()
 
         goal_handle.get_result_async().add_done_callback(
             lambda f: self._nav_done(f, task, agv))
@@ -514,11 +553,21 @@ class AGVScheduler(Node):
 
         with self.lock:
             if agv.state == State.TO_SHELF:
+                agv.state = State.TO_AISLE_EXIT
+                next_xy = task.aisle_exit_xy
+                next_yaw = 0.0
+                next_label = "aisle exit"
+            elif agv.state == State.TO_AISLE_EXIT:
                 agv.state = State.TO_STATION
                 next_xy = self.station_xy
+                next_yaw = 0.0
+                next_label = "station"
             elif agv.state == State.TO_STATION:
                 agv.state = State.IDLE
                 agv.task = None
+                agv.current_goal_xy = None
+                agv.nav_goal_sent_ts = 0.0
+                agv.nav_goal_accepted_ts = 0.0
                 task.status = "done"
                 self._release_route_locked(agv.aid)
                 self.get_logger().info(
@@ -528,11 +577,11 @@ class AGVScheduler(Node):
                 return
 
         self.get_logger().info(
-            f"[ARRIVE] {agv.aid} reached shelf {task.shelf}, "
-            "heading to station")
-        if not self._send_nav(next_xy, 0.0, task, agv):
+            f"[ARRIVE] {agv.aid} reached {task.shelf} step, "
+            f"heading to {next_label}")
+        if not self._send_nav(next_xy, next_yaw, task, agv):
             self._return_task_to_queue(
-                agv, task, "station navigation unavailable")
+                agv, task, f"{next_label} navigation unavailable")
 
     def _return_task_to_queue(self, agv: AGVState, task: Task, reason: str):
         with self.lock:
@@ -541,9 +590,14 @@ class AGVScheduler(Node):
                 current.state = State.IDLE
                 current.task = None
                 current.current_goal_handle = None
+                current.current_goal_xy = None
+                current.nav_goal_sent_ts = 0.0
+                current.nav_goal_accepted_ts = 0.0
                 self._release_route_locked(current.aid)
             task.status = "pending"
             task.agv = ""
+            task.last_error = reason
+            task.retry_after = time.time() + 5.0
             if not any(existing.tid == task.tid for existing in self.queue):
                 self.queue.append(task)
                 self.queue.sort()
@@ -585,6 +639,30 @@ class AGVScheduler(Node):
             if agv.state != State.IDLE and agv.task is None:
                 self._publish_stop(agv.aid)
 
+    def _nav_watchdog(self):
+        victims = []
+        now = time.time()
+        with self.lock:
+            for agv in self.agvs.values():
+                if agv.state == State.IDLE or not agv.task:
+                    continue
+                if not agv.nav_goal_sent_ts:
+                    continue
+                goal_pending = (
+                    agv.current_goal_handle is None
+                    and agv.nav_goal_accepted_ts == 0.0
+                    and now - agv.nav_goal_sent_ts > 5.0
+                )
+                if goal_pending:
+                    victims.append((
+                        agv,
+                        agv.task,
+                        "Nav2 goal was not accepted within 5s",
+                    ))
+
+        for agv, task, reason in victims:
+            self._return_task_to_queue(agv, task, reason)
+
     def _lower_priority_agv(self, left: AGVState, right: AGVState) -> AGVState:
         if left.task and not right.task:
             return left
@@ -611,6 +689,7 @@ class AGVScheduler(Node):
             "shelf_center": list(task.shelf_center_xy),
             "pick": list(task.pick_xy),
             "pick_yaw": task.pick_yaw,
+            "aisle_exit": list(task.aisle_exit_xy),
             "drop": list(task.drop_xy),
             "priority": task.priority,
             "nav_action": agv.nav_action,
@@ -623,6 +702,18 @@ class AGVScheduler(Node):
             payload = {
                 "pending": len(self.queue),
                 "completed": done,
+                "queue": [
+                    {
+                        "tid": task.tid,
+                        "shelf": task.shelf,
+                        "status": task.status,
+                        "requested_agv": task.requested_agv,
+                        "retry_in": max(
+                            0.0, round(task.retry_after - time.time(), 1)),
+                        "last_error": task.last_error,
+                    }
+                    for task in self.queue
+                ],
                 "reservations": {
                     zone: {
                         "agv": reservation.agv_id,
@@ -641,6 +732,12 @@ class AGVScheduler(Node):
                         "nav_action": agv.nav_action,
                         "odom_topic": agv.odom_topic,
                         "cmd_vel_topic": agv.cmd_vel_topic,
+                        "goal": (
+                            [round(agv.current_goal_xy[0], 2),
+                             round(agv.current_goal_xy[1], 2)]
+                            if agv.current_goal_xy else None
+                        ),
+                        "goal_active": agv.current_goal_handle is not None,
                     }
                     for aid, agv in self.agvs.items()
                 },

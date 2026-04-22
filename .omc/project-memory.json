@@ -1,0 +1,77 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1776773370900,
+  "projectRoot": "/home/li/Desktop/yang",
+  "techStack": {
+    "languages": [],
+    "frameworks": [],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "src"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "build": {
+      "path": "build",
+      "purpose": "Build output",
+      "fileCount": 2,
+      "lastAccessed": 1776773370890,
+      "keyFiles": [
+        "COLCON_IGNORE"
+      ]
+    },
+    "install": {
+      "path": "install",
+      "purpose": null,
+      "fileCount": 12,
+      "lastAccessed": 1776773370892,
+      "keyFiles": [
+        "COLCON_IGNORE",
+        "_local_setup_util_ps1.py",
+        "_local_setup_util_sh.py",
+        "local_setup.bash",
+        "local_setup.ps1"
+      ]
+    },
+    "log": {
+      "path": "log",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1776773370893,
+      "keyFiles": [
+        "COLCON_IGNORE"
+      ]
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 1,
+      "lastAccessed": 1776773370893,
+      "keyFiles": [
+        "README.md"
+      ]
+    }
+  },
+  "hotPaths": [],
+  "userDirectives": []
+}
