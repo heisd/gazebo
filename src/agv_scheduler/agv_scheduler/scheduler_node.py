@@ -80,6 +80,17 @@ class AGVState:
     current_goal_yaw: float = 0.0
     nav_goal_sent_ts: float = 0.0
     nav_goal_accepted_ts: float = 0.0
+    pause_until: float = 0.0
+    pending_goal_xy: Optional[Tuple[float, float]] = None
+    pending_goal_yaw: float = 0.0
+    pending_goal_label: str = ""
+    resume_state: State = State.IDLE
+    resume_goal_xy: Optional[Tuple[float, float]] = None
+    resume_goal_yaw: float = 0.0
+    wait_until: float = 0.0
+    wait_point_xy: Optional[Tuple[float, float]] = None
+    yielding_to: str = ""
+    yield_cooldown_until: float = 0.0
 
 
 @dataclass
@@ -133,6 +144,14 @@ class AGVScheduler(Node):
             self.get_parameter("route_hold_timeout").value)
         self.safety_stop_distance = float(
             self.get_parameter("safety_stop_distance").value)
+        self.right_of_way_release_distance = float(
+            self.get_parameter("right_of_way_release_distance").value)
+        self.yield_hold_duration = float(
+            self.get_parameter("yield_hold_duration").value)
+        self.yield_cooldown_duration = float(
+            self.get_parameter("yield_cooldown_duration").value)
+        self.pickup_pause_duration = float(
+            self.get_parameter("pickup_pause_duration").value)
         self.auto_demo_enabled = bool(
             self.get_parameter("auto_demo_enabled").value)
 
@@ -189,6 +208,8 @@ class AGVScheduler(Node):
         self.create_timer(1.0, self._sched_loop)
         self.create_timer(0.5, self._pub_status)
         self.create_timer(0.2, self._safety_loop)
+        self.create_timer(0.2, self._pause_loop)
+        self.create_timer(0.2, self._right_of_way_loop)
         self.create_timer(1.0, self._nav_watchdog)
         self.create_timer(15.0, self._auto_demo)
 
@@ -210,6 +231,10 @@ class AGVScheduler(Node):
         self.declare_parameter("route_cell_size", 2.0)
         self.declare_parameter("route_hold_timeout", 180.0)
         self.declare_parameter("safety_stop_distance", 1.0)
+        self.declare_parameter("right_of_way_release_distance", 1.6)
+        self.declare_parameter("yield_hold_duration", 2.0)
+        self.declare_parameter("yield_cooldown_duration", 3.0)
+        self.declare_parameter("pickup_pause_duration", 4.0)
         self.declare_parameter("auto_demo_enabled", True)
         self.declare_parameter("shelf_layout_file", "")
 
@@ -530,19 +555,24 @@ class AGVScheduler(Node):
             if not current or not current.task or current.task.tid != task.tid:
                 goal_handle.cancel_goal_async()
                 return
+            if current.state == State.WAITING:
+                goal_handle.cancel_goal_async()
+                return
             current.current_goal_handle = goal_handle
             current.nav_goal_accepted_ts = time.time()
 
         goal_handle.get_result_async().add_done_callback(
-            lambda f: self._nav_done(f, task, agv))
+            lambda f, gh=goal_handle: self._nav_done(f, task, agv, gh))
 
-    def _nav_done(self, future, task: Task, agv: AGVState):
+    def _nav_done(self, future, task: Task, agv: AGVState, goal_handle):
         result = future.result()
         status = getattr(result, "status", None)
 
         with self.lock:
             current = self.agvs.get(agv.aid)
             if not current or not current.task or current.task.tid != task.tid:
+                return
+            if current.current_goal_handle is not goal_handle:
                 return
             current.current_goal_handle = None
 
@@ -553,6 +583,18 @@ class AGVScheduler(Node):
 
         with self.lock:
             if agv.state == State.TO_SHELF:
+                if self.pickup_pause_duration > 0.0:
+                    agv.state = State.PICKING
+                    agv.pause_until = time.time() + self.pickup_pause_duration
+                    agv.pending_goal_xy = task.aisle_exit_xy
+                    agv.pending_goal_yaw = 0.0
+                    agv.pending_goal_label = "aisle exit"
+                    task.status = "picking"
+                    self.get_logger().info(
+                        f"[PICKING] {agv.aid} reached {task.shelf}, "
+                        f"waiting {self.pickup_pause_duration:.1f}s")
+                    self._publish_stop(agv.aid)
+                    return
                 agv.state = State.TO_AISLE_EXIT
                 next_xy = task.aisle_exit_xy
                 next_yaw = 0.0
@@ -593,6 +635,17 @@ class AGVScheduler(Node):
                 current.current_goal_xy = None
                 current.nav_goal_sent_ts = 0.0
                 current.nav_goal_accepted_ts = 0.0
+                current.pause_until = 0.0
+                current.pending_goal_xy = None
+                current.pending_goal_yaw = 0.0
+                current.pending_goal_label = ""
+                current.resume_state = State.IDLE
+                current.resume_goal_xy = None
+                current.resume_goal_yaw = 0.0
+                current.wait_until = 0.0
+                current.wait_point_xy = None
+                current.yielding_to = ""
+                current.yield_cooldown_until = 0.0
                 self._release_route_locked(current.aid)
             task.status = "pending"
             task.agv = ""
@@ -605,8 +658,9 @@ class AGVScheduler(Node):
         self.get_logger().warn(f"[REQUEUE] {task.tid}: {reason}")
 
     def _safety_loop(self):
-        victims = []
+        yield_requests = []
         with self.lock:
+            now = time.time()
             agvs = list(self.agvs.values())
             for i, left in enumerate(agvs):
                 for right in agvs[i + 1:]:
@@ -615,29 +669,181 @@ class AGVScheduler(Node):
                     dist = math.hypot(left.x - right.x, left.y - right.y)
                     if dist >= self.safety_stop_distance:
                         continue
-                    victim = self._lower_priority_agv(left, right)
-                    if victim.task:
+
+                    victim = self._right_of_way_victim(left, right, now)
+                    if victim and victim.task:
                         other = (
                             right.aid
                             if victim.aid == left.aid
                             else left.aid
                         )
-                        victims.append((
+                        yield_requests.append((
                             victim.aid,
-                            victim.task,
-                            f"safety stop: {dist:.2f}m from {other}",
+                            other,
+                            dist,
                         ))
 
-        for aid, task, reason in victims:
-            agv = self.agvs[aid]
-            goal_handle = agv.current_goal_handle
-            if goal_handle:
-                goal_handle.cancel_goal_async()
-            self._return_task_to_queue(agv, task, reason)
+        for aid, other, dist in yield_requests:
+            self._yield_for_right_of_way(aid, other, dist)
 
         for agv in self.agvs.values():
             if agv.state != State.IDLE and agv.task is None:
                 self._publish_stop(agv.aid)
+
+    def _right_of_way_victim(
+            self,
+            left: AGVState,
+            right: AGVState,
+            now: float) -> Optional[AGVState]:
+        if left.state == State.WAITING or right.state == State.WAITING:
+            return None
+        if left.yield_cooldown_until > now or right.yield_cooldown_until > now:
+            return None
+        if left.task and not right.task:
+            return left
+        if right.task and not left.task:
+            return right
+
+        left_moving = left.current_goal_handle is not None
+        right_moving = right.current_goal_handle is not None
+        if left_moving and not right_moving:
+            return left
+        if right_moving and not left_moving:
+            return right
+
+        return self._lower_priority_agv(left, right)
+
+    def _goal_for_state(
+            self,
+            agv: AGVState) -> Tuple[Optional[Tuple[float, float]], float]:
+        task = agv.task
+        if not task:
+            return None, 0.0
+        if agv.state == State.TO_SHELF:
+            return task.pick_xy, task.pick_yaw
+        if agv.state == State.TO_AISLE_EXIT:
+            return task.aisle_exit_xy, 0.0
+        if agv.state == State.TO_STATION:
+            return self.station_xy, 0.0
+        return agv.current_goal_xy, agv.current_goal_yaw
+
+    def _yield_for_right_of_way(self, aid: str, other: str, dist: float):
+        goal_handle = None
+        with self.lock:
+            agv = self.agvs[aid]
+            if not agv.task or agv.state == State.WAITING:
+                return
+            now = time.time()
+            if agv.yield_cooldown_until > now:
+                return
+
+            resume_goal_xy, resume_goal_yaw = self._goal_for_state(agv)
+            if not resume_goal_xy:
+                self._publish_stop(agv.aid)
+                return
+
+            goal_handle = agv.current_goal_handle
+            old_state = agv.state
+            agv.current_goal_handle = None
+            agv.state = State.WAITING
+            agv.resume_state = old_state
+            agv.resume_goal_xy = resume_goal_xy
+            agv.resume_goal_yaw = resume_goal_yaw
+            agv.wait_until = now + self.yield_hold_duration
+            agv.wait_point_xy = (agv.x, agv.y)
+            agv.yielding_to = other
+            agv.yield_cooldown_until = (
+                now + self.yield_hold_duration + self.yield_cooldown_duration)
+            agv.nav_goal_sent_ts = 0.0
+            agv.nav_goal_accepted_ts = 0.0
+            agv.task.status = f"waiting:{other}"
+
+        if goal_handle:
+            goal_handle.cancel_goal_async()
+        self._publish_stop(aid)
+        self.get_logger().warn(
+            f"[YIELD] {aid} yields to {other}: "
+            f"{dist:.2f}m < {self.safety_stop_distance:.2f}m")
+
+    def _right_of_way_loop(self):
+        resumes = []
+        now = time.time()
+        with self.lock:
+            for agv in self.agvs.values():
+                if agv.state != State.WAITING or not agv.task:
+                    continue
+                if now < agv.wait_until:
+                    continue
+
+                blocker = self.agvs.get(agv.yielding_to)
+                if blocker:
+                    dist = math.hypot(agv.x - blocker.x, agv.y - blocker.y)
+                    if dist < self.right_of_way_release_distance:
+                        self._publish_stop(agv.aid)
+                        continue
+
+                if not agv.resume_goal_xy:
+                    continue
+
+                task = agv.task
+                resume_state = agv.resume_state
+                resume_goal_xy = agv.resume_goal_xy
+                resume_goal_yaw = agv.resume_goal_yaw
+                agv.state = resume_state
+                agv.resume_state = State.IDLE
+                agv.resume_goal_xy = None
+                agv.resume_goal_yaw = 0.0
+                agv.wait_until = 0.0
+                agv.wait_point_xy = None
+                agv.yielding_to = ""
+                task.status = "running"
+                resumes.append((
+                    agv,
+                    task,
+                    resume_goal_xy,
+                    resume_goal_yaw,
+                    resume_state,
+                ))
+
+        for agv, task, goal_xy, goal_yaw, resume_state in resumes:
+            self.get_logger().info(
+                f"[RESUME] {agv.aid} resumes {resume_state.value} "
+                f"toward ({goal_xy[0]:.1f},{goal_xy[1]:.1f})")
+            if not self._send_nav(goal_xy, goal_yaw, task, agv):
+                self._return_task_to_queue(
+                    agv, task, "right-of-way resume unavailable")
+
+    def _pause_loop(self):
+        dispatches = []
+        now = time.time()
+        with self.lock:
+            for agv in self.agvs.values():
+                if agv.state != State.PICKING or not agv.task:
+                    continue
+                if agv.pause_until <= 0.0 or now < agv.pause_until:
+                    continue
+                if not agv.pending_goal_xy:
+                    continue
+
+                task = agv.task
+                next_xy = agv.pending_goal_xy
+                next_yaw = agv.pending_goal_yaw
+                next_label = agv.pending_goal_label or "next goal"
+                agv.state = State.TO_AISLE_EXIT
+                agv.pause_until = 0.0
+                agv.pending_goal_xy = None
+                agv.pending_goal_yaw = 0.0
+                agv.pending_goal_label = ""
+                task.status = "running"
+                dispatches.append((agv, task, next_xy, next_yaw, next_label))
+
+        for agv, task, next_xy, next_yaw, next_label in dispatches:
+            self.get_logger().info(
+                f"[ARRIVE] {agv.aid} finished pickup pause, "
+                f"heading to {next_label}")
+            if not self._send_nav(next_xy, next_yaw, task, agv):
+                self._return_task_to_queue(
+                    agv, task, f"{next_label} navigation unavailable")
 
     def _nav_watchdog(self):
         victims = []
@@ -738,6 +944,17 @@ class AGVScheduler(Node):
                             if agv.current_goal_xy else None
                         ),
                         "goal_active": agv.current_goal_handle is not None,
+                        "yielding_to": agv.yielding_to or None,
+                        "wait_point": (
+                            [round(agv.wait_point_xy[0], 2),
+                             round(agv.wait_point_xy[1], 2)]
+                            if agv.wait_point_xy else None
+                        ),
+                        "resume_goal": (
+                            [round(agv.resume_goal_xy[0], 2),
+                             round(agv.resume_goal_xy[1], 2)]
+                            if agv.resume_goal_xy else None
+                        ),
                     }
                     for aid, agv in self.agvs.items()
                 },

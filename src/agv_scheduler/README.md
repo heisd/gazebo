@@ -101,12 +101,34 @@ station:
 | `/agv/cmd_vel` 或参数指定的 cmd_vel topic | `geometry_msgs/msg/Twist` | 安全停车时发布零速度 |
 | `navigate_to_pose` 或参数指定的 action | `nav2_msgs/action/NavigateToPose` | 向对应车辆的 Nav2 发送目标点 |
 
+## 停靠等待
+
+当前调度器使用 `NavigateToPose` action，不使用 Nav2 的 `FollowWaypoints`
+流程。因此 `nav2_params.yaml` 里的
+`waypoint_follower.wait_at_waypoint.waypoint_pause_duration` 不会控制货架侧
+等待时间。
+
+货架侧等待由调度器参数 `pickup_pause_duration` 控制，单位是秒。车辆到达
+`pickup` 停靠点后会进入 `PICKING` 状态，等待该时长，再继续去通道出口。
+
 ## 多车避碰策略
 
 调度器现在包含两层避碰：
 
 1. 路径区域预约：分配任务前，调度器会把车辆当前位置到取货点、取货点到通道出口点、通道出口点到出货站的线路按 `route_cell_size` 划成粗粒度区域。若区域已被其他车辆预约，新任务会等待，不会立刻下发 Nav2 目标。
-2. 安全距离停车：运行中周期检查车辆间距。若低于 `safety_stop_distance`，调度器会取消低优先级车辆的当前 Nav2 goal、发布零速度，并把任务重新放回队列。
+2. 路权让行：运行中周期检查车辆间距。若低于 `safety_stop_distance`，调度器会选择让行车辆，取消它当前 Nav2 goal，在当前位置作为临时等待点停车；等距离恢复到 `right_of_way_release_distance` 以上并满足 `yield_hold_duration` 后，再恢复原目标继续执行任务。
+
+路权选择规则：
+
+- 一方有任务、一方无任务时，有任务的一方让行；若它没有当前 Nav2 目标，则保持停车。
+- 一方正在运动、一方已停靠或等待时，运动的一方让行。
+- 两方都在执行任务时，低优先级任务让行。
+- 优先级相同时，车辆 ID 较大的车让行；两车配置下通常是 `agv_02`。
+
+让行车辆会进入 `WAITING` 状态，`/agv/scheduler_status` 会显示
+`yielding_to`、`wait_point` 和 `resume_goal`。等待期间任务不会重新入队，
+只是暂停当前目标；释放后恢复原来的 `TO_SHELF`、`TO_AISLE_EXIT` 或
+`TO_STATION` 目标。
 
 这不是完整的多智能体路径规划，但适合仓储仿真先解决“同一通道/路口抢路”和“近距离碰撞”问题。后续可以把区域预约替换为 Nav2 的真实路径采样或拓扑地图路权。
 
@@ -171,12 +193,15 @@ ros2 topic pub --once /agv/agv_status std_msgs/msg/String \
 | --- | --- |
 | `IDLE` | 空闲，允许接任务 |
 | `TO_SHELF` | 前往货架 |
+| `PICKING` | 已到货架停靠点，按 `pickup_pause_duration` 等待 |
+| `TO_AISLE_EXIT` | 离开货架侧，前往通道出口 |
 | `TO_STATION` | 前往出货站 |
 | `TO_CHARGE` | 前往充电区 |
 | `CHARGING` | 充电中 |
+| `WAITING` | 路权让行中，停在临时等待点并等待恢复原目标 |
 | `ERROR` | 异常 |
 
-代码中还定义了 `PICKING` 和 `DELIVERING`，当前流程没有显式停留在这两个状态。
+代码中还定义了 `DELIVERING`，当前流程没有显式停留在这个状态。
 
 ## 当前注意点
 
