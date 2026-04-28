@@ -201,13 +201,33 @@
           <material><ambient>0.45 0.28 0.10 1</ambient></material></visual>
       </link></model>
 
-    <!-- 出货站台 -->
+    <!-- 出货站台: open dock bay. The center is drivable; side rails mark the bay. -->
     <model name="output_station">
-      <static>true</static><pose>9 0 0.2 0 0 0</pose>
-      <link name="link">
-        <collision name="c"><geometry><box><size>3.0 2.0 0.4</size></box></geometry></collision>
-        <visual name="v"><geometry><box><size>3.0 2.0 0.4</size></box></geometry>
-          <material><ambient>0.15 0.55 0.85 1</ambient></material></visual>
+      <static>true</static><pose>8.6 0 0 0 0 0</pose>
+      <link name="dock_floor">
+        <visual name="v">
+          <pose>0 0 0.025 0 0 0</pose>
+          <geometry><box><size>3.2 2.2 0.05</size></box></geometry>
+          <material><ambient>0.15 0.55 0.85 0.55</ambient></material>
+        </visual>
+      </link>
+      <link name="north_rail">
+        <pose>0 1.15 0.15 0 0 0</pose>
+        <collision name="c"><geometry><box><size>3.2 0.12 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>3.2 0.12 0.30</size></box></geometry>
+          <material><ambient>0.1 0.35 0.75 1</ambient></material></visual>
+      </link>
+      <link name="south_rail">
+        <pose>0 -1.15 0.15 0 0 0</pose>
+        <collision name="c"><geometry><box><size>3.2 0.12 0.30</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>3.2 0.12 0.30</size></box></geometry>
+          <material><ambient>0.1 0.35 0.75 1</ambient></material></visual>
+      </link>
+      <link name="back_stop">
+        <pose>1.55 0 0.20 0 0 0</pose>
+        <collision name="c"><geometry><box><size>0.12 2.2 0.40</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.12 2.2 0.40</size></box></geometry>
+          <material><ambient>0.1 0.35 0.75 1</ambient></material></visual>
       </link>
     </model>
 

@@ -12,6 +12,12 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+PARKING_POSES = {
+    'agv_01': (10.8, 4.0, 3.1416),
+    'agv_02': (10.8, -4.0, 3.1416),
+}
+
+
 def get_robot_description(namespace, prefix):
     desc_dir = get_package_share_directory('agv_description')
     urdf = os.path.join(desc_dir, 'urdf', 'agv_robot.urdf.xacro')
@@ -30,7 +36,7 @@ def get_robot_description(namespace, prefix):
     return result.stdout
 
 
-def make_robot(namespace, prefix, x, y, z='0.12'):
+def make_robot(namespace, prefix, x, y, yaw, z='0.12'):
     robot_desc = get_robot_description(namespace, prefix)
 
     rsp = Node(
@@ -67,6 +73,7 @@ def make_robot(namespace, prefix, x, y, z='0.12'):
             '-entity', namespace,
             '-x', str(x),
             '-y', str(y),
+            '-Y', str(yaw),
             '-z', z,
         ],
         output='screen',
@@ -99,9 +106,9 @@ def generate_launch_description():
     )
 
     agv_01_rsp, agv_01_jsp, agv_01_spawn = make_robot(
-        'agv_01', 'agv_01_', 0.0, -1.0)
+        'agv_01', 'agv_01_', *PARKING_POSES['agv_01'])
     agv_02_rsp, agv_02_jsp, agv_02_spawn = make_robot(
-        'agv_02', 'agv_02_', 0.0, 1.0)
+        'agv_02', 'agv_02_', *PARKING_POSES['agv_02'])
 
     rviz = Node(
         package='rviz2',

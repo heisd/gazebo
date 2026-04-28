@@ -66,6 +66,37 @@ warehouse_layout:
       pickup_yaw: -1.5708
   station:
     center: [9.0, 0.0]
-    dock: [6.4, 0.0]
+    dock: [8.0, 0.0]
   charging:
     center: [9.0, -8.0]
+  traffic_zones:
+    main_corridor:
+      type: exclusive
+      polygon:
+        - [-10.5, -1.5]
+        - [6.2, -1.5]
+        - [6.2, 1.5]
+        - [-10.5, 1.5]
+      wait_points:
+        agv_01: [10.8, 4.0, 3.1416]
+        agv_02: [10.8, -4.0, 3.1416]
+    station_lane:
+      type: exclusive
+      polygon:
+        - [4.8, -6.0]
+        - [6.8, -6.0]
+        - [6.8, 6.0]
+        - [4.8, 6.0]
+      wait_points:
+        agv_01: [10.8, 4.0, 3.1416]
+        agv_02: [10.8, -4.0, 3.1416]
+    station_queue:
+      type: queue
+      polygon:
+        - [6.0, -2.0]
+        - [9.6, -2.0]
+        - [9.6, 2.0]
+        - [6.0, 2.0]
+  wait_points:
+    parking_agv_01: [10.8, 4.0, 3.1416]
+    parking_agv_02: [10.8, -4.0, 3.1416]

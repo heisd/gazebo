@@ -4,6 +4,9 @@ agv_scheduler:
     nav_action_names:
       - "/agv_01/navigate_to_pose"
       - "/agv_02/navigate_to_pose"
+    base_frames:
+      - "agv_01_base_footprint"
+      - "agv_02_base_footprint"
     odom_topics:
       - "/agv_01/odom"
       - "/agv_02/odom"
@@ -13,7 +16,16 @@ agv_scheduler:
     status_topics:
       - "/agv_01/agv_status"
       - "/agv_02/agv_status"
-    route_cell_size: 2.0
+    pose_source: "map_then_odom"
+    map_frame: "map"
+    route_cell_size: 1.5
     route_hold_timeout: 180.0
+    reservation_refresh_interval: 2.0
+    pose_stale_timeout: 8.0
+    wait_point_tolerance: 0.35
     safety_stop_distance: 1.0
+    right_of_way_release_distance: 1.6
+    yield_hold_duration: 2.0
+    yield_cooldown_duration: 3.0
+    pickup_pause_duration: 4.0
     auto_demo_enabled: false

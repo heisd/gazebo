@@ -13,8 +13,8 @@ from launch_ros.actions import Node
 
 
 ROBOTS = [
-    ("agv_01", 0.0, -1.0),
-    ("agv_02", 0.0, 1.0),
+    ("agv_01", 10.8, 4.0, 3.1416),
+    ("agv_02", 10.8, -4.0, 3.1416),
 ]
 
 
@@ -58,6 +58,7 @@ def _set_use_sim_time(node_params, use_sim_time):
 
 
 def _write_robot_params(base_params, robot_id, initial_x, initial_y,
+                        initial_yaw,
                         map_file, use_sim_time):
     params = _replace_strings(copy.deepcopy(base_params), robot_id)
     _set_use_sim_time(params, use_sim_time)
@@ -65,6 +66,7 @@ def _write_robot_params(base_params, robot_id, initial_x, initial_y,
     amcl_params = params["amcl"]["ros__parameters"]
     amcl_params["initial_pose"]["x"] = float(initial_x)
     amcl_params["initial_pose"]["y"] = float(initial_y)
+    amcl_params["initial_pose"]["yaw"] = float(initial_yaw)
     amcl_params["transform_tolerance"] = 0.1
 
     params["map_server"]["ros__parameters"]["yaml_filename"] = map_file
@@ -227,9 +229,9 @@ def _launch_setup(context, *args, **kwargs):
         base_params = yaml.safe_load(stream)
 
     actions = []
-    for robot_id, initial_x, initial_y in ROBOTS:
+    for robot_id, initial_x, initial_y, initial_yaw in ROBOTS:
         robot_params = _write_robot_params(
-            base_params, robot_id, initial_x, initial_y,
+            base_params, robot_id, initial_x, initial_y, initial_yaw,
             map_file, use_sim_time)
         actions.extend(
             _nav2_nodes(robot_id, robot_params, use_sim_time, autostart,
