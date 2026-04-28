@@ -127,6 +127,13 @@ base_frames:
    - 当两车距离小于 `safety_stop_distance` 时，仍会触发强制让行
    - 但 winner / loser 会在一次冲突周期内锁定，避免来回震荡
 
+路权选择规则：
+
+- 一方有任务、一方无任务时，有任务的一方让行；若它没有当前 Nav2 目标，则保持停车。
+- 一方正在运动、一方已停靠或等待时，运动的一方让行。
+- 两方都在执行任务时，低优先级任务让行。
+- 优先级相同时，车辆 ID 较大的车让行；两车配置下通常是 `agv_02`。
+
 等待点到达后，旧预约会主动释放；恢复任务前会重新为当前阶段申请资源。这比单纯靠 `route_hold_timeout` 过期释放更安全。
 
 ## 预约保活
@@ -160,10 +167,20 @@ pose_stale_timeout: 8.0
 
 | Topic / Action | 类型 | 说明 |
 | --- | --- | --- |
-| `/agv/task_assigned` | `std_msgs/msg/String` | 任务分配结果 |
+| `/agv/task_assigned` | `std_msgs/msg/String` | 任务分配结果，包含 AGV、任务号、货架中心、取货停靠点、通道出口点和投放点 |
 | `/agv/scheduler_status` | `std_msgs/msg/String` | 调度器状态、车队状态、预约状态、交通区配置 |
 | `/agv_01/cmd_vel`、`/agv_02/cmd_vel` | `geometry_msgs/msg/Twist` | 强制停车或等待点停车时发布零速度 |
 | `/agv_01/navigate_to_pose`、`/agv_02/navigate_to_pose` | `nav2_msgs/action/NavigateToPose` | 各车导航目标 |
+
+## 停靠等待
+
+当前调度器使用 `NavigateToPose` action，不使用 Nav2 的 `FollowWaypoints`
+流程。因此 `nav2_params.yaml` 里的
+`waypoint_follower.wait_at_waypoint.waypoint_pause_duration` 不会控制货架侧
+等待时间。
+
+货架侧等待由调度器参数 `pickup_pause_duration` 控制，单位是秒。车辆到达
+`pickup` 停靠点后会进入 `PICKING` 状态，等待该时长，再申请下一阶段资源并继续去通道出口。
 
 ## 使用方式
 
@@ -219,8 +236,12 @@ ros2 topic echo --field data /agv/scheduler_status
 | `PICKING` | 已到货架停靠点，按 `pickup_pause_duration` 等待 |
 | `TO_AISLE_EXIT` | 从货架侧退回到通道出口 |
 | `TO_STATION` | 前往出货站 |
+| `TO_CHARGE` | 前往充电区 |
+| `CHARGING` | 充电中 |
 | `WAITING` | 资源冲突或安全让行中，必要时前往固定等待点 |
 | `ERROR` | 异常 |
+
+代码中还定义了 `DELIVERING`，当前流程没有显式停留在这个状态。
 
 ## 当前边界
 
