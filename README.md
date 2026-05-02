@@ -231,6 +231,45 @@ ros2 lifecycle get /agv_02/controller_server
 ros2 lifecycle get /agv_02/bt_navigator
 ```
 
+## 电量消耗与自动充电
+
+调度器内置电量消耗模型，每秒根据车辆运动状态扣除电量；当电量低于阈值且车辆处于空闲时，自动导航前往充电区。
+
+相关参数在 `src/agv_scheduler/config/two_agv_scheduler.yaml`：
+
+```yaml
+battery_drain_moving: 0.3    # %/秒，车辆运动中
+battery_drain_idle: 0.02     # %/秒，车辆静止/空闲
+battery_charge_rate: 1.0     # %/秒，充电中回复速率
+battery_low_threshold: 20.0  # 电量低于此值且空闲时自动去充电
+battery_full_threshold: 95.0 # 充电达到此值后返回 idle
+```
+
+充电站坐标由 `warehouse_layout.yaml` 中的 `charging.center` 定义，当前为 `(9.0, -8.0)`。
+
+充电流程：
+
+1. `_battery_loop` 每秒检查各车电量
+2. 电量 < `battery_low_threshold` 且 `state == IDLE` → 自动下发充电导航目标
+3. 到达充电站 → `state` 切换为 `CHARGING`，每秒回复 `battery_charge_rate`%
+4. 电量 ≥ `battery_full_threshold` → `state` 切换回 `IDLE`，等待新任务
+
+状态流：`IDLE` → `TO_CHARGE` → `CHARGING` → `IDLE`
+
+电量低于 15% 时即使处于 `IDLE` 也不会被派发普通任务（由 `_sched_loop` 把关）。正在执行任务中的车辆不会被中断，任务完成回到 `IDLE` 后由下一轮 `_battery_loop` 触发充电。
+
+查看车辆电量：
+
+```bash
+ros2 topic echo --field data /agv/scheduler_status | python3 -c "
+import sys, json
+for line in sys.stdin:
+    d = json.loads(line)
+    for aid, s in d.get('fleet', {}).items():
+        print(aid, s['state'], 'battery:', s['battery'])
+"
+```
+
 ## 自动演示模式
 
 调度器内置自动演示功能，可在启动后自动随机发出最多 8 个任务，方便快速验证仿真环境是否正常。

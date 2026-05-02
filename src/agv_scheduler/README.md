@@ -172,6 +172,31 @@ pose_stale_timeout: 8.0
 | `/agv_01/cmd_vel`、`/agv_02/cmd_vel` | `geometry_msgs/msg/Twist` | 强制停车或等待点停车时发布零速度 |
 | `/agv_01/navigate_to_pose`、`/agv_02/navigate_to_pose` | `nav2_msgs/action/NavigateToPose` | 各车导航目标 |
 
+## 电量消耗与自动充电
+
+调度器内置电量消耗和自动充电模块，每秒运行一次 `_battery_loop`。
+
+**消耗逻辑：**
+- 运动中（`|vx| > 0.01` 或 `|wz| > 0.01`）：每秒扣 `battery_drain_moving`%
+- 静止时：每秒扣 `battery_drain_idle`%
+
+**充电触发：**
+- 电量 < `battery_low_threshold`（默认 20%）且 `state == IDLE` 时，调度器自动创建内部充电任务（tid 为 `CHARGE_<agv_id>`）并通过 `NavigateToPose` 导航到 `charging_xy`
+- 到达后 `state` 切换为 `CHARGING`，每秒回复 `battery_charge_rate`%
+- 电量 ≥ `battery_full_threshold`（默认 95%）后 `state` 切换回 `IDLE`
+
+**参数：**
+
+```yaml
+battery_drain_moving: 0.3    # %/秒
+battery_drain_idle: 0.02     # %/秒
+battery_charge_rate: 1.0     # %/秒
+battery_low_threshold: 20.0  # 触发充电的阈值 (%)
+battery_full_threshold: 95.0 # 停止充电的阈值 (%)
+```
+
+充电任务不进入普通任务队列；`_return_task_to_queue` 会识别 `CHARGE_` 前缀并跳过重入队。
+
 ## 停靠等待
 
 当前调度器使用 `NavigateToPose` action，不使用 Nav2 的 `FollowWaypoints`

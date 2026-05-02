@@ -29,3 +29,8 @@ agv_scheduler:
     yield_cooldown_duration: 3.0
     pickup_pause_duration: 4.0
     auto_demo_enabled: false
+    battery_drain_moving: 0.3
+    battery_drain_idle: 0.02
+    battery_charge_rate: 1.0
+    battery_low_threshold: 20.0
+    battery_full_threshold: 95.0
