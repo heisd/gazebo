@@ -110,6 +110,15 @@ ros2 topic pub --once /agv/task_request std_msgs/msg/String \
   "{data: '{\"tid\":\"T1002\",\"shelf\":\"B1\",\"priority\":4}'}"
 ```
 
+如需指定某台车执行任务，加上 `agv_id` 字段：
+
+```bash
+ros2 topic pub --once /agv/task_request std_msgs/msg/String \
+  "{data: '{\"tid\":\"T1003\",\"shelf\":\"C2\",\"priority\":3,\"agv_id\":\"agv_01\"}'}"
+```
+
+电量低于 15% 的车辆不会被派发新任务，调度器会跳过并等待其他空闲车辆。
+
 查看调度状态：
 
 ```bash
@@ -122,6 +131,7 @@ ros2 topic echo --field data /agv/scheduler_status
 - `fleet.agv_01.reserved_stage`
 - `fleet.agv_01.reserved_zones`
 - `fleet.agv_01.wait_reason`
+- `fleet.agv_01.wait_zone`
 - `fleet.agv_01.wait_point`
 - `reservations`
 
@@ -221,11 +231,24 @@ ros2 lifecycle get /agv_02/controller_server
 ros2 lifecycle get /agv_02/bt_navigator
 ```
 
+## 自动演示模式
+
+调度器内置自动演示功能，可在启动后自动随机发出最多 8 个任务，方便快速验证仿真环境是否正常。
+
+默认配置（`two_agv_scheduler.yaml`）已关闭该功能：
+
+```yaml
+auto_demo_enabled: false
+```
+
+如需开启，改为 `true` 并重启调度器节点。开启后调度器每 15 秒发一个随机货架任务，到第 8 个任务后停止自动发送。
+
 ## 当前注意点
 
 - 修改 Python 调度代码后，需要重启 `agv_scheduler` 节点；运行中的节点不会热加载源码。
 - 发布多个任务时使用不同 `tid`，例如 `T1001`、`T1002`。
-- 这版调度器已经是“阶段式交通控制”，但路线采样仍是调度器内部估算，不是 Nav2 `ComputePathToPose` 的真实 global path。
+- 电量低于 15% 的车辆不会被派发任务；调度器会跳过该车，等待其他空闲车辆。
+- 这版调度器已经是”阶段式交通控制”，但路线采样仍是调度器内部估算（`route_cell_size: 1.5` 米粒度），不是 Nav2 `ComputePathToPose` 的真实 global path。
 - `src/agv_corridor_layer` 目前还是试验包；如果后续要把预约路径直接注入 costmap，可以继续把它接入 `agv_navigation`。
 - `pickup_pause_duration` 是秒；`waypoint_pause_duration` 是 Nav2 waypoint follower 的毫秒参数，当前调度流程不依赖它。
 - 如果 `lifecycle_manager_navigation` 报 `bt_navigator/get_state service client: async_send_request failed`，先检查对应 Nav2 节点是否已经 `active [3]`，以及 `/agv_01/navigate_to_pose`、`/agv_02/navigate_to_pose` action 是否存在。
