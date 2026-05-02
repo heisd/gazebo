@@ -694,6 +694,17 @@ class AGVScheduler(Node):
             return None
         if left.yield_cooldown_until > now or right.yield_cooldown_until > now:
             return None
+
+        # 最高优先级：低电量或正在充电的车拥有路权，其他车让行
+        left_low = (left.state == State.TO_CHARGE
+                    or left.battery < self.battery_low_threshold)
+        right_low = (right.state == State.TO_CHARGE
+                     or right.battery < self.battery_low_threshold)
+        if left_low and not right_low:
+            return right   # right 让行给低电量的 left
+        if right_low and not left_low:
+            return left    # left 让行给低电量的 right
+
         if left.task and not right.task:
             return left
         if right.task and not left.task:
