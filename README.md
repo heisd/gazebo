@@ -238,25 +238,27 @@ ros2 lifecycle get /agv_02/bt_navigator
 相关参数在 `src/agv_scheduler/config/two_agv_scheduler.yaml`：
 
 ```yaml
-battery_drain_moving: 0.3    # %/秒，车辆运动中
-battery_drain_idle: 0.02     # %/秒，车辆静止/空闲
-battery_charge_rate: 1.0     # %/秒，充电中回复速率
-battery_low_threshold: 20.0  # 电量低于此值且空闲时自动去充电
-battery_full_threshold: 95.0 # 充电达到此值后返回 idle
+battery_drain_moving: 0.3      # %/秒，车辆运动中
+battery_drain_idle: 0.02       # %/秒，车辆静止/空闲
+battery_charge_rate: 1.0       # %/秒，充电中回复速率
+battery_low_threshold: 20.0    # 空闲时触发充电的阈值
+battery_critical_threshold: 10.0  # 紧急充电阈值，中断正在执行的任务
+battery_full_threshold: 95.0   # 充电达到此值后返回 idle
 ```
 
 充电站坐标由 `warehouse_layout.yaml` 中的 `charging.center` 定义，当前为 `(9.0, -8.0)`。
 
-充电流程：
+**充电优先级（最高）：**
 
-1. `_battery_loop` 每秒检查各车电量
-2. 电量 < `battery_low_threshold` 且 `state == IDLE` → 自动下发充电导航目标
-3. 到达充电站 → `state` 切换为 `CHARGING`，每秒回复 `battery_charge_rate`%
-4. 电量 ≥ `battery_full_threshold` → `state` 切换回 `IDLE`，等待新任务
+| 触发条件 | 行为 |
+|---|---|
+| 电量 < `battery_critical_threshold`（10%） | 立刻中断当前任务，任务返回队列，直接导航充电站 |
+| 电量 < `battery_low_threshold`（20%）且空闲 | 正常调度结束后导航充电站 |
+| 电量 < 15% | 不接受新任务（`_sched_loop` 把关） |
 
-状态流：`IDLE` → `TO_CHARGE` → `CHARGING` → `IDLE`
+充电状态流：`任意状态` → `TO_CHARGE` → `CHARGING` → `IDLE`
 
-电量低于 15% 时即使处于 `IDLE` 也不会被派发普通任务（由 `_sched_loop` 把关）。正在执行任务中的车辆不会被中断，任务完成回到 `IDLE` 后由下一轮 `_battery_loop` 触发充电。
+被中断的任务会重新进入等待队列（`retry_after` 延迟 10 秒），充电完成后由调度器正常重新分配。
 
 查看车辆电量：
 

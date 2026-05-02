@@ -179,23 +179,34 @@ pose_stale_timeout: 8.0
 **消耗逻辑：**
 - 运动中（`|vx| > 0.01` 或 `|wz| > 0.01`）：每秒扣 `battery_drain_moving`%
 - 静止时：每秒扣 `battery_drain_idle`%
+- 前往充电站途中（`TO_CHARGE`）正常消耗，不再触发阈值检查
 
-**充电触发：**
-- 电量 < `battery_low_threshold`（默认 20%）且 `state == IDLE` 时，调度器自动创建内部充电任务（tid 为 `CHARGE_<agv_id>`）并通过 `NavigateToPose` 导航到 `charging_xy`
-- 到达后 `state` 切换为 `CHARGING`，每秒回复 `battery_charge_rate`%
-- 电量 ≥ `battery_full_threshold`（默认 95%）后 `state` 切换回 `IDLE`
+**充电触发（最高优先级）：**
+
+| 条件 | 行为 | 入口方法 |
+|---|---|---|
+| 电量 < `battery_critical_threshold`（10%），任意状态 | 立刻中断当前任务，任务重新入队，直接去充电站 | `_emergency_charge` |
+| 电量 < `battery_low_threshold`（20%），`state == IDLE` | 正常发起充电导航 | `_send_to_charge` |
+
+`_emergency_charge` 原子地完成以下操作（持锁）：
+1. 取消当前 Nav2 goal handle
+2. 将被中断任务置回 `pending`，`retry_after + 10s` 后重新参与调度
+3. 将 AGV 状态切换为 `TO_CHARGE`，下发充电导航目标
+
+充电到达后 `state` 切换为 `CHARGING`，每秒回复 `battery_charge_rate`%，达到 `battery_full_threshold` 后回 `IDLE`。
 
 **参数：**
 
 ```yaml
-battery_drain_moving: 0.3    # %/秒
-battery_drain_idle: 0.02     # %/秒
-battery_charge_rate: 1.0     # %/秒
-battery_low_threshold: 20.0  # 触发充电的阈值 (%)
-battery_full_threshold: 95.0 # 停止充电的阈值 (%)
+battery_drain_moving: 0.3        # %/秒
+battery_drain_idle: 0.02         # %/秒
+battery_charge_rate: 1.0         # %/秒
+battery_low_threshold: 20.0      # 空闲时触发充电 (%)
+battery_critical_threshold: 10.0 # 紧急中断任务充电 (%)
+battery_full_threshold: 95.0     # 停止充电 (%)
 ```
 
-充电任务不进入普通任务队列；`_return_task_to_queue` 会识别 `CHARGE_` 前缀并跳过重入队。
+充电任务（tid = `CHARGE_<agv_id>`）不进入普通任务队列；`_return_task_to_queue` 识别 `CHARGE_` 前缀并跳过重入队。
 
 ## 停靠等待
 

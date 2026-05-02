@@ -225,6 +225,8 @@ class AGVScheduler(Node):
             self.get_parameter("battery_charge_rate").value)
         self.battery_low_threshold = float(
             self.get_parameter("battery_low_threshold").value)
+        self.battery_critical_threshold = float(
+            self.get_parameter("battery_critical_threshold").value)
         self.battery_full_threshold = float(
             self.get_parameter("battery_full_threshold").value)
         self.path_sample_step = max(0.25, self.route_cell_size / 2.0)
@@ -341,6 +343,7 @@ class AGVScheduler(Node):
         self.declare_parameter("battery_drain_idle", 0.01)
         self.declare_parameter("battery_charge_rate", 0.5)
         self.declare_parameter("battery_low_threshold", 20.0)
+        self.declare_parameter("battery_critical_threshold", 10.0)
         self.declare_parameter("battery_full_threshold", 95.0)
         self.declare_parameter("shelf_layout_file", "")
 
@@ -918,6 +921,7 @@ class AGVScheduler(Node):
 
     def _battery_loop(self):
         charge_agvs = []
+        emergency_agvs = []
         fully_charged = []
         with self.lock:
             for agv in self.agvs.values():
@@ -934,7 +938,12 @@ class AGVScheduler(Node):
                 drain = self.battery_drain_moving if moving else self.battery_drain_idle
                 agv.battery = max(0.0, round(agv.battery - drain, 3))
 
-                if (agv.battery < self.battery_low_threshold
+                if agv.state == State.TO_CHARGE:
+                    continue
+
+                if agv.battery < self.battery_critical_threshold:
+                    emergency_agvs.append(agv.aid)
+                elif (agv.battery < self.battery_low_threshold
                         and agv.state == State.IDLE
                         and agv.task is None):
                     charge_agvs.append(agv.aid)
@@ -942,6 +951,11 @@ class AGVScheduler(Node):
         for aid, pct in fully_charged:
             self.get_logger().info(
                 f"[CHARGE] {aid} fully charged ({pct:.1f}%), returning to idle")
+
+        for aid in emergency_agvs:
+            agv = self.agvs.get(aid)
+            if agv:
+                self._emergency_charge(agv)
 
         for aid in charge_agvs:
             agv = self.agvs.get(aid)
@@ -979,6 +993,73 @@ class AGVScheduler(Node):
             f"[CHARGE] {agv.aid} battery={agv.battery:.1f}% < "
             f"{self.battery_low_threshold:.0f}%, heading to charger at "
             f"({self.charging_xy[0]:.1f},{self.charging_xy[1]:.1f})")
+
+    def _emergency_charge(self, agv: AGVState):
+        """Highest-priority charge: interrupt any ongoing task and go charge now."""
+        charge_task = Task(
+            tid=f"CHARGE_{agv.aid}",
+            shelf="",
+            shelf_center_xy=self.charging_xy,
+            pick_xy=self.charging_xy,
+            pick_yaw=0.0,
+            aisle_exit_xy=self.charging_xy,
+            drop_xy=self.charging_xy,
+            priority=0,
+            agv=agv.aid,
+            status="charging",
+        )
+        interrupted_tid = None
+        goal_handle = None
+        with self.lock:
+            if agv.state in (State.TO_CHARGE, State.CHARGING):
+                return
+            if agv.task and not agv.task.tid.startswith("CHARGE_"):
+                interrupted_tid = agv.task.tid
+                goal_handle = agv.current_goal_handle
+                agv.task.status = "pending"
+                agv.task.agv = ""
+                agv.task.last_error = "battery critical"
+                agv.task.retry_after = time.time() + 10.0
+                if not any(existing.tid == agv.task.tid for existing in self.queue):
+                    self.queue.append(agv.task)
+                    self.queue.sort()
+            agv.state = State.TO_CHARGE
+            agv.task = charge_task
+            agv.current_goal_handle = None
+            agv.current_goal_xy = None
+            agv.current_goal_yaw = 0.0
+            agv.nav_goal_sent_ts = 0.0
+            agv.nav_goal_accepted_ts = 0.0
+            agv.pause_until = 0.0
+            agv.resume_state = State.IDLE
+            agv.resume_goal_xy = None
+            agv.resume_goal_yaw = 0.0
+            agv.wait_until = 0.0
+            agv.wait_point_xy = None
+            agv.wait_point_yaw = 0.0
+            agv.wait_reason = ""
+            agv.wait_zone = ""
+            agv.yielding_to = ""
+            agv.yield_cooldown_until = 0.0
+            self._release_route_locked(agv.aid)
+            self._clear_conflict_locks_for_agv_locked(agv.aid)
+
+        if goal_handle:
+            goal_handle.cancel_goal_async()
+
+        if not self._send_nav(self.charging_xy, 0.0, charge_task, agv):
+            with self.lock:
+                if agv.state == State.TO_CHARGE:
+                    agv.state = State.IDLE
+                    agv.task = None
+            self.get_logger().warn(
+                f"[CHARGE] {agv.aid} CRITICAL: Nav2 not ready for emergency charge")
+            return
+
+        self.get_logger().warn(
+            f"[CHARGE] {agv.aid} CRITICAL battery={agv.battery:.1f}% < "
+            f"{self.battery_critical_threshold:.0f}% — interrupted "
+            f"{interrupted_tid or 'idle'}, going to charger NOW")
 
     def _release_route_locked(self, aid: str):
         for zone in list(self.route_reservations):
