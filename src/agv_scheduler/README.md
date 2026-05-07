@@ -12,6 +12,7 @@
 | `launch/two_agv_scheduler.launch.py` | 两车调度节点启动入口 |
 | `setup.py` | 注册 `scheduler_node` 命令 |
 | `test/` | Python lint/版权/docstring 测试模板 |
+| `docs/scheduler_data_flow.md` | 调度器代码分析与 Mermaid 数据流图 |
 
 ## 当前调度思路
 
