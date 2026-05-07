@@ -110,6 +110,15 @@ ros2 topic pub --once /agv/task_request std_msgs/msg/String \
   "{data: '{\"tid\":\"T1002\",\"shelf\":\"B1\",\"priority\":4}'}"
 ```
 
+如需指定某台车执行任务，加上 `agv_id` 字段：
+
+```bash
+ros2 topic pub --once /agv/task_request std_msgs/msg/String \
+  "{data: '{\"tid\":\"T1003\",\"shelf\":\"C2\",\"priority\":3,\"agv_id\":\"agv_01\"}'}"
+```
+
+电量低于 15% 的车辆不会被派发新任务，调度器会跳过并等待其他空闲车辆。
+
 查看调度状态：
 
 ```bash
@@ -122,6 +131,7 @@ ros2 topic echo --field data /agv/scheduler_status
 - `fleet.agv_01.reserved_stage`
 - `fleet.agv_01.reserved_zones`
 - `fleet.agv_01.wait_reason`
+- `fleet.agv_01.wait_zone`
 - `fleet.agv_01.wait_point`
 - `reservations`
 
@@ -160,12 +170,13 @@ src/agv_scheduler/config/two_agv_scheduler.yaml
 1. 路径区域预约：每个阶段开始前，调度器会把当前位置到目标点的线路按 `route_cell_size` 划成粗粒度区域。若区域已被其他车辆预约，新阶段会等待，不会立刻下发 Nav2 目标。
 2. 路权让行：运行中若两车距离低于 `safety_stop_distance`，调度器会选择一台车让行，优先让它驶向配置好的等待点；距离恢复到 `right_of_way_release_distance` 以上后，再恢复原目标继续任务。
 
-路权选择规则：
+路权选择规则（优先级从高到低）：
 
-- 一方有任务、一方无任务时，有任务的一方让行；若它没有当前 Nav2 目标，则保持停车。
-- 一方正在运动、一方已停靠或等待时，运动的一方让行。
-- 两方都在执行任务时，低优先级任务让行。
-- 优先级相同时，车辆 ID 较大的车让行；两车配置下通常是 `agv_02`。
+1. **低电量/充电优先**：一方处于 `TO_CHARGE` 状态或电量 < `battery_low_threshold`（20%）时，另一方让行。
+2. 一方有任务、一方无任务时，有任务的一方让行；若它没有当前 Nav2 目标，则保持停车。
+3. 一方正在运动、一方已停靠或等待时，运动的一方让行。
+4. 两方都在执行任务时，低优先级任务让行。
+5. 优先级相同时，车辆 ID 较大的车让行；两车配置下通常是 `agv_02`。
 
 相关参数在 `src/agv_scheduler/config/two_agv_scheduler.yaml`：
 
@@ -221,11 +232,65 @@ ros2 lifecycle get /agv_02/controller_server
 ros2 lifecycle get /agv_02/bt_navigator
 ```
 
+## 电量消耗与自动充电
+
+调度器内置电量消耗模型，每秒根据车辆运动状态扣除电量；当电量低于阈值且车辆处于空闲时，自动导航前往充电区。
+
+相关参数在 `src/agv_scheduler/config/two_agv_scheduler.yaml`：
+
+```yaml
+battery_drain_moving: 0.3      # %/秒，车辆运动中
+battery_drain_idle: 0.02       # %/秒，车辆静止/空闲
+battery_charge_rate: 1.0       # %/秒，充电中回复速率
+battery_low_threshold: 20.0    # 空闲时触发充电的阈值
+battery_critical_threshold: 10.0  # 紧急充电阈值，中断正在执行的任务
+battery_full_threshold: 95.0   # 充电达到此值后返回 idle
+```
+
+充电站坐标由 `warehouse_layout.yaml` 中的 `charging.center` 定义，当前为 `(9.0, -8.0)`。
+
+**充电优先级（最高）：**
+
+| 触发条件 | 行为 |
+|---|---|
+| 电量 < `battery_critical_threshold`（10%） | 立刻中断当前任务，任务返回队列，直接导航充电站 |
+| 电量 < `battery_low_threshold`（20%）且空闲 | 正常调度结束后导航充电站 |
+| 电量 < 15% | 不接受新任务（`_sched_loop` 把关） |
+
+充电状态流：`任意状态` → `TO_CHARGE` → `CHARGING` → `IDLE`
+
+被中断的任务会重新进入等待队列（`retry_after` 延迟 10 秒），充电完成后由调度器正常重新分配。
+
+查看车辆电量：
+
+```bash
+ros2 topic echo --field data /agv/scheduler_status | python3 -c "
+import sys, json
+for line in sys.stdin:
+    d = json.loads(line)
+    for aid, s in d.get('fleet', {}).items():
+        print(aid, s['state'], 'battery:', s['battery'])
+"
+```
+
+## 自动演示模式
+
+调度器内置自动演示功能，可在启动后自动随机发出最多 8 个任务，方便快速验证仿真环境是否正常。
+
+默认配置（`two_agv_scheduler.yaml`）已关闭该功能：
+
+```yaml
+auto_demo_enabled: false
+```
+
+如需开启，改为 `true` 并重启调度器节点。开启后调度器每 15 秒发一个随机货架任务，到第 8 个任务后停止自动发送。
+
 ## 当前注意点
 
 - 修改 Python 调度代码后，需要重启 `agv_scheduler` 节点；运行中的节点不会热加载源码。
 - 发布多个任务时使用不同 `tid`，例如 `T1001`、`T1002`。
-- 这版调度器已经是“阶段式交通控制”，但路线采样仍是调度器内部估算，不是 Nav2 `ComputePathToPose` 的真实 global path。
+- 电量低于 15% 的车辆不会被派发任务；调度器会跳过该车，等待其他空闲车辆。
+- 这版调度器已经是”阶段式交通控制”，但路线采样仍是调度器内部估算（`route_cell_size: 1.5` 米粒度），不是 Nav2 `ComputePathToPose` 的真实 global path。
 - `src/agv_corridor_layer` 目前还是试验包；如果后续要把预约路径直接注入 costmap，可以继续把它接入 `agv_navigation`。
 - `pickup_pause_duration` 是秒；`waypoint_pause_duration` 是 Nav2 waypoint follower 的毫秒参数，当前调度流程不依赖它。
 - 如果 `lifecycle_manager_navigation` 报 `bt_navigator/get_state service client: async_send_request failed`，先检查对应 Nav2 节点是否已经 `active [3]`，以及 `/agv_01/navigate_to_pose`、`/agv_02/navigate_to_pose` action 是否存在。

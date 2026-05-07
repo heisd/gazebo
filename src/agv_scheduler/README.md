@@ -127,12 +127,13 @@ base_frames:
    - 当两车距离小于 `safety_stop_distance` 时，仍会触发强制让行
    - 但 winner / loser 会在一次冲突周期内锁定，避免来回震荡
 
-路权选择规则：
+路权选择规则（优先级从高到低）：
 
-- 一方有任务、一方无任务时，有任务的一方让行；若它没有当前 Nav2 目标，则保持停车。
-- 一方正在运动、一方已停靠或等待时，运动的一方让行。
-- 两方都在执行任务时，低优先级任务让行。
-- 优先级相同时，车辆 ID 较大的车让行；两车配置下通常是 `agv_02`。
+1. **低电量/充电优先（最高）**：一方处于 `TO_CHARGE` 或电量 < `battery_low_threshold` 时，另一方让行。
+2. 一方有任务、一方无任务 → 有任务的让行。
+3. 一方运动、一方停止 → 运动的让行。
+4. 两方都有任务 → 低优先级让行。
+5. 优先级相同 → agv_id 较大的让行（通常 `agv_02`）。
 
 等待点到达后，旧预约会主动释放；恢复任务前会重新为当前阶段申请资源。这比单纯靠 `route_hold_timeout` 过期释放更安全。
 
@@ -171,6 +172,42 @@ pose_stale_timeout: 8.0
 | `/agv/scheduler_status` | `std_msgs/msg/String` | 调度器状态、车队状态、预约状态、交通区配置 |
 | `/agv_01/cmd_vel`、`/agv_02/cmd_vel` | `geometry_msgs/msg/Twist` | 强制停车或等待点停车时发布零速度 |
 | `/agv_01/navigate_to_pose`、`/agv_02/navigate_to_pose` | `nav2_msgs/action/NavigateToPose` | 各车导航目标 |
+
+## 电量消耗与自动充电
+
+调度器内置电量消耗和自动充电模块，每秒运行一次 `_battery_loop`。
+
+**消耗逻辑：**
+- 运动中（`|vx| > 0.01` 或 `|wz| > 0.01`）：每秒扣 `battery_drain_moving`%
+- 静止时：每秒扣 `battery_drain_idle`%
+- 前往充电站途中（`TO_CHARGE`）正常消耗，不再触发阈值检查
+
+**充电触发（最高优先级）：**
+
+| 条件 | 行为 | 入口方法 |
+|---|---|---|
+| 电量 < `battery_critical_threshold`（10%），任意状态 | 立刻中断当前任务，任务重新入队，直接去充电站 | `_emergency_charge` |
+| 电量 < `battery_low_threshold`（20%），`state == IDLE` | 正常发起充电导航 | `_send_to_charge` |
+
+`_emergency_charge` 原子地完成以下操作（持锁）：
+1. 取消当前 Nav2 goal handle
+2. 将被中断任务置回 `pending`，`retry_after + 10s` 后重新参与调度
+3. 将 AGV 状态切换为 `TO_CHARGE`，下发充电导航目标
+
+充电到达后 `state` 切换为 `CHARGING`，每秒回复 `battery_charge_rate`%，达到 `battery_full_threshold` 后回 `IDLE`。
+
+**参数：**
+
+```yaml
+battery_drain_moving: 0.3        # %/秒
+battery_drain_idle: 0.02         # %/秒
+battery_charge_rate: 1.0         # %/秒
+battery_low_threshold: 20.0      # 空闲时触发充电 (%)
+battery_critical_threshold: 10.0 # 紧急中断任务充电 (%)
+battery_full_threshold: 95.0     # 停止充电 (%)
+```
+
+充电任务（tid = `CHARGE_<agv_id>`）不进入普通任务队列；`_return_task_to_queue` 识别 `CHARGE_` 前缀并跳过重入队。
 
 ## 停靠等待
 
