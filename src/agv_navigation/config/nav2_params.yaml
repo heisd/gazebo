@@ -151,7 +151,8 @@ controller_server:
       stateful: true
       plugin: nav2_controller::SimpleGoalChecker
       xy_goal_tolerance: 0.20
-      yaw_goal_tolerance: 6.28
+      # 0.5 rad ≈ 28°：约束朝向但保留 MPPI 收敛空间，配合调度器 PICKING 停留覆盖速度残留
+      yaw_goal_tolerance: 0.5
 
     FollowPath:
       plugin: nav2_mppi_controller::MPPIController
