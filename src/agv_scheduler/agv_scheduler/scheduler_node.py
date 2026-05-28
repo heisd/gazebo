@@ -107,6 +107,10 @@ class AGVState:
     last_progress_xy: Tuple[float, float] = field(default_factory=lambda: (0.0, 0.0))
     last_progress_ts: float = 0.0
     spacetime_path: List[Tuple[str, float]] = field(default_factory=list)
+    # nav_seq：每次 _send_nav 自增，用于让被取消/被替换的 goal 回调自我作废
+    nav_seq: int = 0
+    # pick_until_ts：进入 PICKING 后的取货截止时刻；0 表示未在取货
+    pick_until_ts: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -292,6 +296,9 @@ class AGVScheduler(Node):
     STALL_TIMEOUT  = 45.0
     STALL_MIN_DIST = 0.3
 
+    # 到达货架后停车并保持该状态的时长（秒），覆盖 Nav2 速度残留并给 controller 收尾时间
+    PICK_DURATION  = 1.5
+
     # 对方车体轮廓点云参数
     PEER_HALF_LEN  = 0.45   # 车长一半（米）
     PEER_HALF_WID  = 0.45   # 车宽一半（米）
@@ -378,6 +385,7 @@ class AGVScheduler(Node):
         self.create_timer(1.0,  self._sched_loop)
         self.create_timer(0.5,  self._pub_status)
         self.create_timer(0.2,  self._publish_peer_obstacles)  # 5Hz 点云注入
+        self.create_timer(0.2,  self._pickup_check)            # 5Hz PICKING→TO_AISLE_EXIT
         self.create_timer(0.5,  self._proximity_monitor)
         self.create_timer(1.0,  self._nav_watchdog)
         self.create_timer(5.0,  self._stall_check)
@@ -648,53 +656,77 @@ class AGVScheduler(Node):
 
         with self.lock:
             cur = self.agvs.get(agv.aid)
-            if cur:
-                cur.current_goal_handle  = None
-                cur.current_goal_xy      = xy
-                cur.current_goal_yaw     = yaw
-                cur.nav_goal_sent_ts     = time.time()
-                cur.nav_goal_accepted_ts = 0.0
+            if not cur:
+                return False
+            cur.nav_seq             += 1
+            seq                      = cur.nav_seq
+            cur.current_goal_handle  = None
+            cur.current_goal_xy      = xy
+            cur.current_goal_yaw     = yaw
+            cur.nav_goal_sent_ts     = time.time()
+            cur.nav_goal_accepted_ts = 0.0
 
         future = client.send_goal_async(goal)
-        future.add_done_callback(lambda f: self._nav_accepted(f, task, agv))
+        future.add_done_callback(lambda f: self._nav_accepted(f, task, agv, seq))
         self.get_logger().info(
             f"[Nav2] {agv.aid} goal=({xy[0]:.1f},{xy[1]:.1f},yaw={yaw:.2f}) "
-            f"via {agv.nav_action}"
+            f"seq={seq} via {agv.nav_action}"
         )
         return True
 
-    def _nav_accepted(self, future, task: Task, agv: AGVState):
+    def _nav_accepted(self, future, task: Task, agv: AGVState, seq: int):
+        def stale() -> bool:
+            cur = self.agvs.get(agv.aid)
+            return (
+                cur is None
+                or cur.nav_seq != seq
+                or not cur.task
+                or cur.task.tid != task.tid
+            )
+
         try:
             goal_handle = future.result()
         except Exception as exc:
+            with self.lock:
+                if stale():
+                    return
             self._return_task_to_queue(agv, task, f"goal response failed: {exc}")
             return
         if goal_handle is None:
+            with self.lock:
+                if stale():
+                    return
             self._return_task_to_queue(agv, task, "empty goal response")
             return
         if not goal_handle.accepted:
+            with self.lock:
+                if stale():
+                    return
             self._return_task_to_queue(agv, task, "goal rejected")
             return
 
         with self.lock:
-            cur = self.agvs.get(agv.aid)
-            if not cur or not cur.task or cur.task.tid != task.tid:
+            if stale():
                 goal_handle.cancel_goal_async()
                 return
+            cur = self.agvs[agv.aid]
             cur.current_goal_handle  = goal_handle
             cur.nav_goal_accepted_ts = time.time()
 
         goal_handle.get_result_async().add_done_callback(
-            lambda f: self._nav_done(f, task, agv)
+            lambda f: self._nav_done(f, task, agv, seq)
         )
 
-    def _nav_done(self, future, task: Task, agv: AGVState):
+    def _nav_done(self, future, task: Task, agv: AGVState, seq: int):
         result = future.result()
         status = getattr(result, "status", None)
 
         with self.lock:
             cur = self.agvs.get(agv.aid)
-            if not cur or not cur.task or cur.task.tid != task.tid:
+            if not cur or cur.nav_seq != seq:
+                # 已被新一轮 _send_nav 或 stall 重发顶替，丢弃此回调
+                return
+            if not cur.task or cur.task.tid != task.tid:
                 return
             cur.current_goal_handle = None
 
@@ -702,13 +734,18 @@ class AGVScheduler(Node):
             self._return_task_to_queue(agv, task, f"navigation status {status}")
             return
 
+        next_xy: Optional[Tuple[float, float]] = None
+        next_yaw   = 0.0
+        next_label = ""
         with self.lock:
             cur = self.agvs[agv.aid]
             if cur.state == State.TO_SHELF:
-                cur.state  = State.TO_AISLE_EXIT
-                next_xy    = task.aisle_exit_xy
-                next_yaw   = 0.0
-                next_label = "aisle exit"
+                # 到达货架：进入 PICKING，先停车并保持，避免立即跨腿产生速度残留+抖动
+                cur.state                = State.PICKING
+                cur.pick_until_ts        = time.time() + self.PICK_DURATION
+                cur.nav_goal_sent_ts     = 0.0   # 阻止 _nav_watchdog 误判
+                cur.nav_goal_accepted_ts = 0.0
+                cur.last_progress_ts     = time.time()
             elif cur.state == State.TO_AISLE_EXIT:
                 cur.state  = State.TO_STATION
                 next_xy    = self.station_xy
@@ -720,12 +757,22 @@ class AGVScheduler(Node):
                 cur.current_goal_xy      = None
                 cur.nav_goal_sent_ts     = 0.0
                 cur.nav_goal_accepted_ts = 0.0
+                cur.pick_until_ts        = 0.0
                 task.status = "done"
                 self.stt.release(agv.aid)
                 self.get_logger().info(f"[DONE] {task.tid} completed by {agv.aid}")
                 return
             else:
                 return
+
+        if next_xy is None:
+            # PICKING 分支：先停一脚速度，剩下的等 _pickup_check 接力
+            self._publish_stop(agv.aid)
+            self.get_logger().info(
+                f"[PICKING] {agv.aid} 到达货架 {task.shelf}，"
+                f"取货停留 {self.PICK_DURATION:.1f}s"
+            )
+            return
 
         self.get_logger().info(
             f"[ARRIVE] {agv.aid} reached step → heading to {next_label}"
@@ -734,16 +781,41 @@ class AGVScheduler(Node):
             self._return_task_to_queue(
                 agv, task, f"{next_label} navigation unavailable")
 
+    def _pickup_check(self):
+        """轮询：PICKING 倒计时到期后发起前往巷道出口的下一段导航。"""
+        ready: List[Tuple[AGVState, Task]] = []
+        now = time.time()
+        with self.lock:
+            for agv in self.agvs.values():
+                if (agv.state == State.PICKING
+                        and agv.task
+                        and 0.0 < agv.pick_until_ts <= now):
+                    agv.pick_until_ts    = 0.0
+                    agv.state            = State.TO_AISLE_EXIT
+                    agv.last_progress_ts = now
+                    ready.append((agv, agv.task))
+
+        for agv, task in ready:
+            self.get_logger().info(
+                f"[PICK_DONE] {agv.aid} 取货完成，前往巷道出口 "
+                f"({task.aisle_exit_xy[0]:.1f},{task.aisle_exit_xy[1]:.1f})"
+            )
+            if not self._send_nav(task.aisle_exit_xy, 0.0, task, agv):
+                self._return_task_to_queue(
+                    agv, task, "aisle exit navigation unavailable")
+
     def _return_task_to_queue(self, agv: AGVState, task: Task, reason: str):
         with self.lock:
             cur = self.agvs.get(agv.aid)
             if cur:
+                cur.nav_seq             += 1   # 让仍在飞的回调自我作废
                 cur.state                = State.IDLE
                 cur.task                 = None
                 cur.current_goal_handle  = None
                 cur.current_goal_xy      = None
                 cur.nav_goal_sent_ts     = 0.0
                 cur.nav_goal_accepted_ts = 0.0
+                cur.pick_until_ts        = 0.0
                 self.stt.release(cur.aid)
             task.status      = "pending"
             task.agv         = ""
@@ -857,29 +929,47 @@ class AGVScheduler(Node):
             for agv in self.agvs.values():
                 if agv.state == State.IDLE or not agv.task:
                     continue
+                if agv.state == State.PICKING:   # 取货停留是预期行为，不算卡死
+                    continue
                 if agv.last_progress_ts == 0.0:
                     continue
                 if now - agv.last_progress_ts > self.STALL_TIMEOUT:
                     stalled.append(agv)
 
         for agv in stalled:
-            if not agv.task or not agv.current_goal_xy:
-                continue
+            with self.lock:
+                cur = self.agvs.get(agv.aid)
+                if not cur or not cur.task or not cur.current_goal_xy:
+                    continue
+                # 让旧 goal 的回调失效，避免 cancel+_send_nav 与 _nav_done 竞态把任务踢回队列
+                cur.nav_seq             += 1
+                old_handle               = cur.current_goal_handle
+                cur.current_goal_handle  = None
+                cur.last_progress_ts     = time.time()
+                goal_xy                  = cur.current_goal_xy
+                goal_yaw                 = cur.current_goal_yaw
+                task                     = cur.task
+                aid                      = cur.aid
+
             self.get_logger().warn(
-                f"[STALL] {agv.aid} 卡死超过 {self.STALL_TIMEOUT}s，"
-                f"重新规划至 ({agv.current_goal_xy[0]:.1f},"
-                f"{agv.current_goal_xy[1]:.1f})"
+                f"[STALL] {aid} 卡死超过 {self.STALL_TIMEOUT}s，"
+                f"重新规划至 ({goal_xy[0]:.1f},{goal_xy[1]:.1f})"
             )
-            if agv.current_goal_handle:
-                agv.current_goal_handle.cancel_goal_async()
-                agv.current_goal_handle = None
-            agv.last_progress_ts = time.time()
-            self._send_nav(
-                agv.current_goal_xy,
-                agv.current_goal_yaw,
-                agv.task,
-                agv,
-            )
+
+            def resend(_unused, agv=agv, task=task, goal_xy=goal_xy, goal_yaw=goal_yaw):
+                if not self._send_nav(goal_xy, goal_yaw, task, agv):
+                    self._return_task_to_queue(
+                        agv, task, "stall recovery navigation unavailable")
+
+            if old_handle is not None:
+                try:
+                    old_handle.cancel_goal_async().add_done_callback(resend)
+                except Exception as exc:
+                    self.get_logger().warn(
+                        f"[STALL] {aid} cancel 失败，直接重发: {exc}")
+                    resend(None)
+            else:
+                resend(None)
 
     # -----------------------------------------------------------------------
     # Nav watchdog
@@ -891,6 +981,8 @@ class AGVScheduler(Node):
         with self.lock:
             for agv in self.agvs.values():
                 if agv.state == State.IDLE or not agv.task:
+                    continue
+                if agv.state == State.PICKING:   # 取货停留期间无在飞 goal，跳过
                     continue
                 if not agv.nav_goal_sent_ts:
                     continue
