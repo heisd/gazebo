@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+
+import copy
+import os
+import tempfile
+
+import yaml
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, SetEnvironmentVariable
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+
+ROBOTS = [
+    ("agv_01", 0.0, -1.0),
+    ("agv_02", 0.0, 1.0),
+]
+
+
+def _as_bool(value):
+    return str(value).lower() in ("1", "true", "yes", "on")
+
+
+def _replace_strings(value, robot_id):
+    substitutions = [
+        ("/agv/scan",      f"/{robot_id}/scan"),
+        ("/agv/odom",      f"/{robot_id}/odom"),
+        ("base_footprint", f"{robot_id}_base_footprint"),
+        ("base_link",      f"{robot_id}_base_link"),
+        ("/agv/peer_obstacles",      f"/{robot_id}/peer_obstacles"),
+    ]
+    if isinstance(value, str):
+        result = value
+        for old, new in substitutions:
+            result = result.replace(old, new)
+        if result == "odom":
+            result = f"{robot_id}_odom"
+        return result
+    if isinstance(value, list):
+        return [_replace_strings(item, robot_id) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _replace_strings(item, robot_id)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _patch_robot_specific(params, robot_id):
+    odom_topic = f"/{robot_id}/odom"
+    scan_topic = f"/{robot_id}/scan"
+    odom_frame = f"{robot_id}_odom"
+    base_frame = f"{robot_id}_base_footprint"
+
+    # bt_navigator
+    bt = params.get("bt_navigator", {}).get("ros__parameters", {})
+    bt["odom_topic"]       = odom_topic
+    bt["robot_base_frame"] = base_frame
+
+    # velocity_smoother
+    vs = params.get("velocity_smoother", {}).get("ros__parameters", {})
+    vs["odom_topic"] = odom_topic
+
+    # amcl
+    amcl = params.get("amcl", {}).get("ros__parameters", {})
+    amcl["scan_topic"]    = scan_topic
+    amcl["base_frame_id"] = base_frame
+    amcl["odom_frame_id"] = odom_frame
+
+    # local_costmap
+    lc = (params.get("local_costmap", {})
+               .get("local_costmap", {})
+               .get("ros__parameters", {}))
+    lc["robot_base_frame"] = base_frame
+    lc["global_frame"]     = odom_frame
+    obs = lc.get("obstacle_layer", {})
+    obs.setdefault("scan", {})["topic"] = scan_topic
+    lc["obstacle_layer"] = obs
+
+    # global_costmap
+    gc = (params.get("global_costmap", {})
+               .get("global_costmap", {})
+               .get("ros__parameters", {}))
+    gc["robot_base_frame"] = base_frame
+    obs_g = gc.get("obstacle_layer", {})
+    obs_g.setdefault("scan", {})["topic"] = scan_topic
+    gc["obstacle_layer"] = obs_g
+
+
+def _set_use_sim_time(node_params, use_sim_time):
+    for node_cfg in node_params.values():
+        if not isinstance(node_cfg, dict):
+            continue
+        ros_params = node_cfg.get("ros__parameters")
+        if isinstance(ros_params, dict):
+            ros_params["use_sim_time"] = use_sim_time
+        for child_cfg in node_cfg.values():
+            if not isinstance(child_cfg, dict):
+                continue
+            child_params = child_cfg.get("ros__parameters")
+            if isinstance(child_params, dict):
+                child_params["use_sim_time"] = use_sim_time
+
+
+def _write_robot_params(base_params, robot_id, initial_x, initial_y,
+                        map_file, use_sim_time):
+    # 步骤1：通用字符串替换
+    params = _replace_strings(copy.deepcopy(base_params), robot_id)
+    # 步骤2：显式修补深层嵌套参数（保证正确性）
+    _patch_robot_specific(params, robot_id)
+    # 步骤3：设置仿真时间
+    _set_use_sim_time(params, use_sim_time)
+
+    amcl_params = params["amcl"]["ros__parameters"]
+    amcl_params["initial_pose"]["x"] = float(initial_x)
+    amcl_params["initial_pose"]["y"] = float(initial_y)
+    amcl_params["transform_tolerance"] = 0.1
+
+    params["map_server"]["ros__parameters"]["yaml_filename"] = map_file
+
+    fd, path = tempfile.mkstemp(
+        prefix=f"{robot_id}_nav2_", suffix=".yaml")
+    with os.fdopen(fd, "w") as stream:
+        yaml.safe_dump({robot_id: params}, stream, sort_keys=False)
+    return path
+
+
+def _nav2_nodes(robot_id, params_file, use_sim_time, autostart,
+                localization_mode):
+    tf_remaps = [("/tf", "/tf"), ("/tf_static", "/tf_static")]
+    use_amcl = localization_mode == "amcl"
+    lifecycle_localization = ["map_server", "amcl"] if use_amcl else [
+        "map_server"]
+    lifecycle_navigation = [
+        "controller_server",
+        "smoother_server",
+        "planner_server",
+        "behavior_server",
+        "bt_navigator",
+        "waypoint_follower",
+        "velocity_smoother",
+    ]
+
+    common = {
+        "namespace": robot_id,
+        "parameters": [params_file],
+        "output": "screen",
+    }
+
+    nodes = [
+        Node(
+            package="nav2_map_server",
+            executable="map_server",
+            name="map_server",
+            remappings=tf_remaps,
+            **common,
+        ),
+        Node(
+            package="nav2_lifecycle_manager",
+            executable="lifecycle_manager",
+            name="lifecycle_manager_localization",
+            namespace=robot_id,
+            output="screen",
+            parameters=[{
+                "use_sim_time": use_sim_time,
+                "autostart": autostart,
+                "node_names": lifecycle_localization,
+            }],
+        ),
+    ]
+
+    if use_amcl:
+        nodes.insert(1, Node(
+            package="nav2_amcl",
+            executable="amcl",
+            name="amcl",
+            remappings=tf_remaps,
+            **common,
+        ))
+    else:
+        nodes.insert(1, Node(
+            package="tf2_ros",
+            executable="static_transform_publisher",
+            name="map_to_odom_broadcaster",
+            namespace=robot_id,
+            arguments=[
+                "0", "0", "0", "0", "0", "0",
+                "map", f"{robot_id}_odom",
+            ],
+            output="screen",
+        ))
+
+    nodes.extend([
+        Node(
+            package="nav2_controller",
+            executable="controller_server",
+            name="controller_server",
+            remappings=tf_remaps + [("cmd_vel", "cmd_vel_nav")],
+            **common,
+        ),
+        Node(
+            package="nav2_smoother",
+            executable="smoother_server",
+            name="smoother_server",
+            remappings=tf_remaps,
+            **common,
+        ),
+        Node(
+            package="nav2_planner",
+            executable="planner_server",
+            name="planner_server",
+            remappings=tf_remaps,
+            **common,
+        ),
+        Node(
+            package="nav2_behaviors",
+            executable="behavior_server",
+            name="behavior_server",
+            remappings=tf_remaps,
+            **common,
+        ),
+        Node(
+            package="nav2_bt_navigator",
+            executable="bt_navigator",
+            name="bt_navigator",
+            remappings=tf_remaps,
+            **common,
+        ),
+        Node(
+            package="nav2_waypoint_follower",
+            executable="waypoint_follower",
+            name="waypoint_follower",
+            remappings=tf_remaps,
+            **common,
+        ),
+        Node(
+            package="nav2_velocity_smoother",
+            executable="velocity_smoother",
+            name="velocity_smoother",
+            remappings=tf_remaps + [
+                ("cmd_vel", "cmd_vel_nav"),
+                ("cmd_vel_smoothed", "cmd_vel"),
+            ],
+            **common,
+        ),
+        Node(
+            package="nav2_lifecycle_manager",
+            executable="lifecycle_manager",
+            name="lifecycle_manager_navigation",
+            namespace=robot_id,
+            output="screen",
+            parameters=[{
+                "use_sim_time": use_sim_time,
+                "autostart": autostart,
+                "node_names": lifecycle_navigation,
+            }],
+        ),
+    ])
+    return nodes
+
+
+def _launch_setup(context, *args, **kwargs):
+    params_file = LaunchConfiguration("params_file").perform(context)
+    map_file = LaunchConfiguration("map").perform(context)
+    use_sim_time = _as_bool(
+        LaunchConfiguration("use_sim_time").perform(context))
+    autostart = _as_bool(LaunchConfiguration("autostart").perform(context))
+    localization_mode = LaunchConfiguration("localization_mode").perform(
+        context)
+    if localization_mode not in ("odom", "amcl"):
+        raise ValueError(
+            "localization_mode must be 'odom' or 'amcl', "
+            f"got {localization_mode!r}")
+
+    with open(params_file, "r") as stream:
+        base_params = yaml.safe_load(stream)
+
+    actions = []
+    for robot_id, initial_x, initial_y in ROBOTS:
+        robot_params = _write_robot_params(
+            base_params, robot_id, initial_x, initial_y,
+            map_file, use_sim_time)
+        actions.extend(
+            _nav2_nodes(robot_id, robot_params, use_sim_time, autostart,
+                        localization_mode))
+    return actions
+
+
+def generate_launch_description():
+    nav_dir = get_package_share_directory("agv_navigation")
+    default_params = os.path.join(nav_dir, "config", "nav2_params.yaml")
+    default_map = os.path.join(nav_dir, "maps", "warehouse.yaml")
+
+    return LaunchDescription([
+        SetEnvironmentVariable("RCUTILS_LOGGING_BUFFERED_STREAM", "1"),
+        DeclareLaunchArgument("use_sim_time", default_value="true"),
+        DeclareLaunchArgument("autostart", default_value="true"),
+        DeclareLaunchArgument(
+            "localization_mode",
+            default_value="odom",
+            description="Use 'odom' for deterministic simulation or 'amcl' "
+                        "for particle-filter localization.",
+        ),
+        DeclareLaunchArgument("params_file", default_value=default_params),
+        DeclareLaunchArgument("map", default_value=default_map),
+        OpaqueFunction(function=_launch_setup),
+    ])

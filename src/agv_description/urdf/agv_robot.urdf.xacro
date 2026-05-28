@@ -1,0 +1,187 @@
+<?xml version="1.0"?>
+<robot name="agv_robot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:arg name="namespace" default="agv"/>
+  <xacro:arg name="prefix" default=""/>
+  <xacro:arg name="enable_ros2_control" default="true"/>
+
+  <xacro:property name="PI" value="3.14159265"/>
+  <xacro:property name="robot_namespace" value="$(arg namespace)"/>
+  <xacro:property name="prefix" value="$(arg prefix)"/>
+  <xacro:property name="base_x"       value="0.65"/>
+  <xacro:property name="base_y"       value="0.50"/>
+  <xacro:property name="base_z"       value="0.18"/>
+  <xacro:property name="wheel_r"      value="0.10"/>
+  <xacro:property name="wheel_w"      value="0.06"/>
+  <xacro:property name="track"        value="0.30"/>
+  <xacro:property name="wheel_base_x" value="0.20"/>
+
+  <material name="agv_black"> <color rgba="0.1 0.1 0.1 1.0"/></material>
+  <material name="agv_grey">  <color rgba="0.5 0.5 0.5 1.0"/></material>
+  <material name="agv_yellow"><color rgba="1.0 0.8 0.0 1.0"/></material>
+
+  <link name="${prefix}base_footprint">
+    <visual><geometry><sphere radius="0.001"/></geometry></visual>
+  </link>
+
+  <joint name="${prefix}base_footprint_joint" type="fixed">
+    <parent link="${prefix}base_footprint"/>
+    <child  link="${prefix}base_link"/>
+    <origin xyz="0 0 ${wheel_r}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="${prefix}base_link">
+    <visual>
+      <geometry><box size="${base_x} ${base_y} ${base_z}"/></geometry>
+      <material name="agv_black"/> </visual>
+    <collision>
+      <geometry><box size="${base_x} ${base_y} ${base_z}"/></geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 -0.05" rpy="0 0 0"/>  
+      <mass value="40.0"/>
+      <inertia ixx="0.8" ixy="0.0" ixz="0.0" iyy="1.2" iyz="0.0" izz="1.5"/>
+    </inertial>
+  </link>
+
+  <gazebo reference="${prefix}base_link">
+    <material>Gazebo/Black</material>
+  </gazebo>
+
+  <xacro:macro name="wheel" params="name px py">
+    <joint name="${prefix}${name}_joint" type="continuous">
+      <parent link="${prefix}base_link"/>
+      <child  link="${prefix}${name}_link"/>
+      <origin xyz="${px} ${py} ${-base_z/2}" rpy="${-PI/2} 0 0"/>
+      <axis xyz="0 0 1"/>
+      <dynamics damping="0.1" friction="0.5"/>
+    </joint>
+    <link name="${prefix}${name}_link">
+      <visual>
+        <geometry><cylinder radius="${wheel_r}" length="${wheel_w}"/></geometry>
+        <material name="agv_grey"/>
+      </visual>
+      <collision>
+        <geometry><cylinder radius="${wheel_r-0.001}" length="${wheel_w}"/></geometry>
+      </collision>
+      <inertial>
+        <mass value="2.5"/>
+        <inertia ixx="0.008" ixy="0" ixz="0" iyy="0.008" iyz="0" izz="0.012"/>
+      </inertial>
+    </link>
+  </xacro:macro>
+
+  <xacro:wheel name="front_left_wheel"  px=" ${wheel_base_x}" py=" ${track}"/>
+  <xacro:wheel name="front_right_wheel" px=" ${wheel_base_x}" py="-${track}"/>
+  <xacro:wheel name="rear_left_wheel"   px="-${wheel_base_x}" py=" ${track}"/>
+  <xacro:wheel name="rear_right_wheel"  px="-${wheel_base_x}" py="-${track}"/>
+
+  <joint name="${prefix}lidar_joint" type="fixed">
+    <parent link="${prefix}base_link"/>
+    <child  link="${prefix}lidar_link"/>
+    <origin xyz="0.28 0.0 ${base_z/2+0.04}" rpy="0 0 0"/>
+  </joint>
+  <link name="${prefix}lidar_link">
+    <visual>
+      <geometry><cylinder radius="0.045" length="0.07"/></geometry>
+      <material name="agv_grey"/>
+    </visual>
+    <inertial><mass value="0.25"/><inertia ixx="0.0002" ixy="0" ixz="0" iyy="0.0002" iyz="0" izz="0.0003"/></inertial>
+  </link>
+
+  <gazebo reference="${prefix}lidar_link">
+    <sensor name="${prefix}agv_lidar" type="ray">
+      <always_on>true</always_on>
+      <update_rate>10</update_rate>
+      <visualize>true</visualize>
+      <ray>
+        <scan>
+          <horizontal>
+            <samples>720</samples>
+            <resolution>1</resolution>
+            <min_angle>${-PI}</min_angle>
+            <max_angle>${PI}</max_angle>
+          </horizontal>
+        </scan>
+        <range>
+          <min>0.12</min>
+          <max>12.0</max>
+          <resolution>0.01</resolution>
+        </range>
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.01</stddev>
+        </noise>
+      </ray>
+      <plugin name="${prefix}agv_lidar_controller" filename="libgazebo_ros_ray_sensor.so">
+        <ros>
+          <namespace>/${robot_namespace}</namespace>
+          <remapping>~/out:=scan</remapping>
+        </ros>
+        <output_type>sensor_msgs/LaserScan</output_type>
+        <frame_name>${prefix}lidar_link</frame_name>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <xacro:if value="$(arg enable_ros2_control)">
+    <ros2_control name="${prefix}agv_hardware" type="system">
+      <hardware><plugin>gazebo_ros2_control/GazeboSystem</plugin></hardware>
+      <joint name="${prefix}front_left_wheel_joint">
+        <command_interface name="velocity"><param name="min">-3.0</param><param name="max">3.0</param></command_interface>
+        <state_interface name="position"/><state_interface name="velocity"/>
+      </joint>
+      <joint name="${prefix}front_right_wheel_joint">
+        <command_interface name="velocity"><param name="min">-3.0</param><param name="max">3.0</param></command_interface>
+        <state_interface name="position"/><state_interface name="velocity"/>
+      </joint>
+      <joint name="${prefix}rear_left_wheel_joint">
+        <command_interface name="velocity"><param name="min">-3.0</param><param name="max">3.0</param></command_interface>
+        <state_interface name="position"/><state_interface name="velocity"/>
+      </joint>
+      <joint name="${prefix}rear_right_wheel_joint">
+        <command_interface name="velocity"><param name="min">-3.0</param><param name="max">3.0</param></command_interface>
+        <state_interface name="position"/><state_interface name="velocity"/>
+      </joint>
+    </ros2_control>
+
+    <gazebo>
+      <plugin name="${prefix}gazebo_ros2_control" filename="libgazebo_ros2_control.so">
+        <parameters>$(find agv_description)/config/ros2_controllers.yaml</parameters>
+      </plugin>
+    </gazebo>
+  </xacro:if>
+
+  <gazebo>
+    <plugin name="${prefix}diff_drive_controller" filename="libgazebo_ros_diff_drive.so">
+      <ros><namespace>/${robot_namespace}</namespace></ros>
+      <left_joint>${prefix}rear_left_wheel_joint</left_joint>
+      <right_joint>${prefix}rear_right_wheel_joint</right_joint>
+      <wheel_separation>${track * 2}</wheel_separation>
+      <wheel_diameter>${wheel_r * 2}</wheel_diameter>
+      <max_wheel_torque>150.0</max_wheel_torque> <max_wheel_acceleration>1.0</max_wheel_acceleration>
+      <publish_odom>true</publish_odom>
+      <publish_odom_tf>true</publish_odom_tf>
+      <odometry_frame>${prefix}odom</odometry_frame>
+      <robot_base_frame>${prefix}base_footprint</robot_base_frame>
+      <command_topic>cmd_vel</command_topic>
+    </plugin>
+  </gazebo>
+
+  <xacro:macro name="wheel_physics" params="name mu">
+    <gazebo reference="${prefix}${name}_link">
+      <mu1>${mu}</mu1>
+      <mu2>${mu}</mu2>
+      <kp>1000000.0</kp>
+      <kd>100.0</kd>
+      <minDepth>0.001</minDepth>
+    </gazebo>
+  </xacro:macro>
+
+  <xacro:wheel_physics name="front_left_wheel"  mu="0.01"/>
+  <xacro:wheel_physics name="front_right_wheel" mu="0.01"/>
+  <xacro:wheel_physics name="rear_left_wheel"   mu="1.5"/>
+  <xacro:wheel_physics name="rear_right_wheel"  mu="1.5"/>
+
+</robot>

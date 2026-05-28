@@ -1,0 +1,21 @@
+agv_scheduler:
+  ros__parameters:
+    agv_ids: ["agv_01", "agv_02"]
+    nav_action_names:
+      - "/agv_01/navigate_to_pose"
+      - "/agv_02/navigate_to_pose"
+    odom_topics:
+      - "/agv_01/odom"
+      - "/agv_02/odom"
+    cmd_vel_topics:
+      - "/agv_01/cmd_vel"
+      - "/agv_02/cmd_vel"
+    status_topics:
+      - "/agv_01/agv_status"
+      - "/agv_02/agv_status"
+    vehicle_classes: ["EMPTY", "EMPTY"]
+    route_cell_size: 2.0
+    route_hold_timeout: 180.0
+    spacetime_time_buffer: 4.0
+    deadlock_check_period: 5.0
+    auto_demo_enabled: false
