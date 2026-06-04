@@ -61,8 +61,10 @@ python3 tools/closed_loop_sim.py
 | **SIM**（默认） | `python3 tools/control_panel.py` | 在本机用 `closed_loop_sim.py` 的 ROS 桩 + 运动学世界跑真实调度逻辑，无需 ROS/Gazebo，可直接点按驱动两车 |
 | **ROS** | `python3 tools/control_panel.py --ros` | 在装有 ROS 2 的机器人主机上，桥接到正在运行的调度器（发布 `/agv/agv_command`、订阅 `/agv/scheduler_status`） |
 
-常用参数：`--port 8080`（端口）、`--host 0.0.0.0`、`--rate 2`（SIM 倍速）。
-打开浏览器访问 `http://<host>:<port>`。
+常用参数：`--port 8080`（端口）、`--host`（默认 `127.0.0.1` 仅本机；接口无鉴权，
+要让局域网访问才显式传 `--host 0.0.0.0`，且只在可信网络里用）、`--rate 2`（SIM
+倍速）。打开浏览器访问 `http://<host>:<port>`。活动日志在 SIM 模式来自仿真日志，
+在 ROS 模式来自 `/rosout`（过滤 `agv_scheduler` 节点）。
 
 ## 面板能力
 

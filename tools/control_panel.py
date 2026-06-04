@@ -246,6 +246,8 @@ class SimBackend:
 class RosBackend:
     mode = "ros"
 
+    _LEVELS = {10: "DEBUG", 20: "INFO", 30: "WARN", 40: "ERROR", 50: "FATAL"}
+
     def __init__(self):
         import rclpy
         from std_msgs.msg import String
@@ -258,6 +260,16 @@ class RosBackend:
         self._log = deque(maxlen=60)
         self.node.create_subscription(
             String, "/agv/scheduler_status", self._on_status, 10)
+        # Tail the scheduler's own log lines via the standard /rosout topic so
+        # the panel's activity log works in ROS mode too (the status topic
+        # itself carries no log).
+        try:
+            from rcl_interfaces.msg import Log
+            self.node.create_subscription(
+                Log, "/rosout", self._on_rosout, 10)
+        except Exception as exc:
+            self.node.get_logger().warn(
+                f"/rosout unavailable, panel log disabled: {exc}")
         self._rclpy = rclpy
         self._thread = threading.Thread(
             target=lambda: rclpy.spin(self.node), daemon=True)
@@ -267,6 +279,18 @@ class RosBackend:
             self._status = json.loads(msg.data)
         except Exception:
             pass
+
+    def _on_rosout(self, msg):
+        # Only the scheduler node's lines; mirror the sim log entry shape.
+        if "agv_scheduler" not in getattr(msg, "name", ""):
+            return
+        stamp = getattr(msg, "stamp", None)
+        t = round(stamp.sec + stamp.nanosec * 1e-9, 1) if stamp else 0.0
+        self._log.append({
+            "t": t,
+            "level": self._LEVELS.get(msg.level, "INFO"),
+            "text": msg.msg,
+        })
 
     def start(self):
         self._thread.start()
@@ -280,7 +304,7 @@ class RosBackend:
     def status(self):
         st = dict(self._status)
         st["mode"] = self.mode
-        st.setdefault("log", list(self._log))
+        st["log"] = list(self._log)
         return st
 
 
@@ -630,7 +654,7 @@ function draw(st){
 function marker(g,p,col,txt){
   const [x,y]=W2C(p[0],p[1]);
   g.fillStyle=col;g.beginPath();g.arc(x,y,6,0,7);g.fill();
-  g.fillStyle='#cfe;';g.font='10px sans-serif';g.textAlign='center';
+  g.font='10px sans-serif';g.textAlign='center';
   g.fillStyle='#c7d2dd';g.fillText(txt,x,y-10);
 }
 init();
@@ -641,17 +665,16 @@ init();
 
 
 # --------------------------------------------------------------------------
-def build_backend(use_ros):
-    if use_ros:
-        return RosBackend()
-    return SimBackend()
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ros", action="store_true",
                     help="bridge to a live ROS scheduler instead of the sim")
-    ap.add_argument("--host", default="0.0.0.0")
+    # Secure default: loopback only. The endpoints drive the fleet with no
+    # auth, so binding all interfaces (--host 0.0.0.0) exposes robot control
+    # to the whole network — opt in explicitly.
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="bind address; use 0.0.0.0 to expose on the network "
+                         "(unauthenticated — only on a trusted LAN)")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--rate", type=float, default=2.0,
                     help="sim speed multiplier (sim mode only)")
@@ -663,6 +686,9 @@ def main():
     Handler.backend = backend
     Handler.layout = load_layout()
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    if args.host == "0.0.0.0":
+        print("[panel] WARNING: bound to 0.0.0.0 with no authentication — "
+              "anyone on the network can drive the fleet")
     print(f"[panel] backend={backend.mode}  serving http://{args.host}:"
           f"{args.port}  (Ctrl-C to stop)")
     try:

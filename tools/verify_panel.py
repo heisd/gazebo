@@ -72,6 +72,37 @@ def test_manual_stop():
           f"state={agv.state.value}")
 
 
+def test_manual_goto_not_hijacked():
+    """A manual goto (runs in RETURNING state) must not be auto-reassigned by
+    the scheduler when a normal task is waiting in the queue."""
+    b = fresh()
+    b.command({"cmd": "goto", "agv_id": "agv_01", "x": -9.0, "y": 5.0})
+    b.step_for(2)
+    b.command({"cmd": "task", "shelf": "C3", "priority": 5, "tid": "HJ1"})
+    b.step_for(4)  # _sched_loop runs at 1 Hz
+    a1 = b.sched.agvs["agv_01"]
+    keeps = a1.task is not None and a1.task.kind == "manual"
+    check("manual goto is NOT hijacked by a queued task",
+          keeps,
+          f"task={a1.task.tid if a1.task else None} state={a1.state.value}")
+
+
+def test_command_rejects_non_object_json():
+    """Valid-but-non-object JSON on the command channel must be handled, not
+    crash the subscription callback."""
+    b = fresh()
+    for payload in ("[1,2,3]", '"hi"', "42", "null"):
+        s = b.sim.FakeString()
+        s.data = payload
+        try:
+            b.sched._on_command(s)
+        except Exception as exc:
+            check("command channel tolerates non-object JSON (no crash)",
+                  False, f"payload {payload!r} raised {type(exc).__name__}")
+            return
+    check("command channel tolerates non-object JSON (no crash)", True)
+
+
 def test_manual_return_and_charge():
     b = fresh()
     State = b.mod.State
@@ -369,6 +400,8 @@ def main():
     print("\n-- Panel control (operator commands drive the fleet) --")
     test_manual_goto()
     test_manual_stop()
+    test_manual_goto_not_hijacked()
+    test_command_rejects_non_object_json()
     test_manual_return_and_charge()
     test_end_to_end_fleet()
     print("\n-- Reviewed bug fixes --")

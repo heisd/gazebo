@@ -666,6 +666,9 @@ class AGVScheduler(Node):
         except Exception as exc:
             self.get_logger().warn(f"Command parse error: {exc}")
             return
+        if not isinstance(data, dict):
+            self.get_logger().warn("Command payload must be a JSON object")
+            return
         cmd = str(data.get("cmd", "")).strip().lower()
         if cmd in ("", "task"):
             self._on_task(msg)
@@ -1427,13 +1430,15 @@ class AGVScheduler(Node):
         with self.lock:
             self._cleanup_route_reservations_locked()
             now = time.time()
-            # RETURNING AGVs are still available: a pending task can interrupt
-            # the home trip (including a reservation wait) so a backlog never
-            # wastes a return leg.
+            # A return-home trip is interruptible: a pending task can take over
+            # the home leg (even while it waits on a reservation) so a backlog
+            # never wastes a return. Operator MANUAL gotos also run in the
+            # RETURNING state but must NOT be auto-hijacked, so they are gated
+            # on kind == "return" here, not on the state alone.
             idle = [
                 agv for agv in self.agvs.values()
-                if (agv.state in (State.IDLE, State.RETURNING)
-                    or (agv.state == State.WAITING
+                if (agv.state == State.IDLE
+                    or (agv.state in (State.RETURNING, State.WAITING)
                         and agv.task
                         and agv.task.kind == "return"))
                 and agv.battery > self.battery_min_dispatch
