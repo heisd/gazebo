@@ -575,7 +575,8 @@ class AGVScheduler(Node):
                 return
             with self.lock:
                 agv = self.agvs[aid]
-                agv.state = State(data.get("state", agv.state.value))
+                # Vehicle status is telemetry; scheduler-owned state encodes
+                # reservations, resume targets, and Nav2 goal semantics.
                 agv.battery = float(data.get("battery", agv.battery))
         except Exception as exc:
             self.get_logger().warn(f"AGV status parse error: {exc}")
@@ -590,8 +591,9 @@ class AGVScheduler(Node):
             shelf_location = self.shelves[shelf]
 
             self._task_cnt += 1
+            tid = data.get("tid", f"T{self._task_cnt:04d}")
             task = Task(
-                tid=data.get("tid", f"T{self._task_cnt:04d}"),
+                tid=tid,
                 shelf=shelf,
                 shelf_center_xy=shelf_location.center_xy,
                 pick_xy=shelf_location.pick_xy,
@@ -605,6 +607,17 @@ class AGVScheduler(Node):
                 requested_agv=data.get("agv_id", data.get("agv", "")),
             )
             with self.lock:
+                known_tids = {queued.tid for queued in self.queue}
+                known_tids.update(
+                    active.task.tid
+                    for active in self.agvs.values()
+                    if active.task
+                )
+                known_tids.update(done.tid for done in self.history)
+                if task.tid in known_tids:
+                    self.get_logger().warn(
+                        f"Duplicate task id ignored: {task.tid}")
+                    return
                 self.queue.append(task)
                 self.queue.sort()
             self.get_logger().info(
@@ -955,7 +968,9 @@ class AGVScheduler(Node):
                 drain = self.battery_drain_moving if moving else self.battery_drain_idle
                 agv.battery = max(0.0, round(agv.battery - drain, 3))
 
-                if agv.state == State.TO_CHARGE:
+                if (agv.state == State.TO_CHARGE
+                        or (agv.task
+                            and agv.task.tid.startswith("CHARGE_"))):
                     continue
 
                 if agv.battery < self.battery_critical_threshold:
@@ -995,21 +1010,25 @@ class AGVScheduler(Node):
         with self.lock:
             if agv.state != State.IDLE or agv.task is not None:
                 return
-            agv.state = State.TO_CHARGE
             agv.task = charge_task
+            prep = self._prepare_stage_dispatch_locked(
+                agv,
+                charge_task,
+                State.TO_CHARGE,
+                wait_on_block=True,
+                use_wait_point=False,
+            )
 
-        if not self._send_nav(self.charging_xy, 0.0, charge_task, agv):
-            with self.lock:
-                if agv.state == State.TO_CHARGE:
-                    agv.state = State.IDLE
-                    agv.task = None
+        if prep["action"] == "dispatch":
             self.get_logger().warn(
-                f"[CHARGE] {agv.aid} Nav2 not ready, will retry on next battery check")
-            return
-        self.get_logger().warn(
-            f"[CHARGE] {agv.aid} battery={agv.battery:.1f}% < "
-            f"{self.battery_low_threshold:.0f}%, heading to charger at "
-            f"({self.charging_xy[0]:.1f},{self.charging_xy[1]:.1f})")
+                f"[CHARGE] {agv.aid} battery={agv.battery:.1f}% < "
+                f"{self.battery_low_threshold:.0f}%, heading to charger at "
+                f"({self.charging_xy[0]:.1f},{self.charging_xy[1]:.1f})")
+        else:
+            self.get_logger().warn(
+                f"[CHARGE] {agv.aid} waiting for reserved route to "
+                f"charger via {prep.get('blocker', 'traffic')}")
+        self._execute_prepared_stage(agv, charge_task, prep)
 
     def _emergency_charge(self, agv: AGVState):
         """Highest-priority charge: interrupt any ongoing task and go charge now."""
@@ -1027,20 +1046,25 @@ class AGVScheduler(Node):
         )
         interrupted_tid = None
         goal_handle = None
+        prep = None
         with self.lock:
-            if agv.state in (State.TO_CHARGE, State.CHARGING):
+            if (agv.state in (State.TO_CHARGE, State.CHARGING)
+                    or (agv.task
+                        and agv.task.tid.startswith("CHARGE_"))):
                 return
-            if agv.task and not agv.task.tid.startswith("CHARGE_"):
+            if agv.task:
                 interrupted_tid = agv.task.tid
                 goal_handle = agv.current_goal_handle
-                agv.task.status = "pending"
-                agv.task.agv = ""
-                agv.task.last_error = "battery critical"
-                agv.task.retry_after = time.time() + 10.0
-                if not any(existing.tid == agv.task.tid for existing in self.queue):
-                    self.queue.append(agv.task)
-                    self.queue.sort()
-            agv.state = State.TO_CHARGE
+                if not agv.task.tid.startswith(("CHARGE_", "RETURN_")):
+                    agv.task.status = "pending"
+                    agv.task.agv = ""
+                    agv.task.last_error = "battery critical"
+                    agv.task.retry_after = time.time() + 10.0
+                    if not any(
+                            existing.tid == agv.task.tid
+                            for existing in self.queue):
+                        self.queue.append(agv.task)
+                        self.queue.sort()
             agv.task = charge_task
             agv.current_goal_handle = None
             agv.current_goal_xy = None
@@ -1060,23 +1084,28 @@ class AGVScheduler(Node):
             agv.yield_cooldown_until = 0.0
             self._release_route_locked(agv.aid)
             self._clear_conflict_locks_for_agv_locked(agv.aid)
+            prep = self._prepare_stage_dispatch_locked(
+                agv,
+                charge_task,
+                State.TO_CHARGE,
+                wait_on_block=True,
+                use_wait_point=False,
+            )
 
         if goal_handle:
             goal_handle.cancel_goal_async()
 
-        if not self._send_nav(self.charging_xy, 0.0, charge_task, agv):
-            with self.lock:
-                if agv.state == State.TO_CHARGE:
-                    agv.state = State.IDLE
-                    agv.task = None
+        if prep["action"] == "dispatch":
             self.get_logger().warn(
-                f"[CHARGE] {agv.aid} CRITICAL: Nav2 not ready for emergency charge")
-            return
-
-        self.get_logger().warn(
-            f"[CHARGE] {agv.aid} CRITICAL battery={agv.battery:.1f}% < "
-            f"{self.battery_critical_threshold:.0f}% — interrupted "
-            f"{interrupted_tid or 'idle'}, going to charger NOW")
+                f"[CHARGE] {agv.aid} CRITICAL battery={agv.battery:.1f}% < "
+                f"{self.battery_critical_threshold:.0f}% — interrupted "
+                f"{interrupted_tid or 'idle'}, going to charger NOW")
+        else:
+            self.get_logger().warn(
+                f"[CHARGE] {agv.aid} CRITICAL interrupted "
+                f"{interrupted_tid or 'idle'}, waiting for reserved charger "
+                f"route via {prep.get('blocker', 'traffic')}")
+        self._execute_prepared_stage(agv, charge_task, prep)
 
     def _release_route_locked(self, aid: str):
         for zone in list(self.route_reservations):
@@ -1094,7 +1123,7 @@ class AGVScheduler(Node):
             task: Task,
             stage: State,
             wait_on_block: bool,
-            use_wait_point: bool = True) -> dict:
+            use_wait_point: bool = False) -> dict:
         goal_xy, goal_yaw, label = self._goal_for_state(task, stage)
         blocker, blocked_zones = self._reserve_stage_locked(
             agv, task, stage, start_xy=(agv.x, agv.y))
@@ -1428,34 +1457,36 @@ class AGVScheduler(Node):
             elif agv.state == State.TO_CHARGE:
                 if status == GoalStatus.STATUS_SUCCEEDED:
                     agv.state = State.CHARGING
+                    agv.task = None
+                    agv.current_goal_xy = None
+                    agv.current_goal_yaw = 0.0
+                    self._release_route_locked(agv.aid)
+                    self._clear_conflict_locks_for_agv_locked(agv.aid)
                     self.get_logger().info(
                         f"[CHARGE] {agv.aid} docked at charger, charging ...")
+                    publish_stop = True
                 else:
-                    agv.state = State.IDLE
-                    self.get_logger().warn(
-                        f"[CHARGE] {agv.aid} failed to reach charger "
-                        f"(status={status}), will retry")
-                agv.task = None
-                agv.current_goal_xy = None
-                agv.current_goal_yaw = 0.0
-                self._release_route_locked(agv.aid)
-                self._clear_conflict_locks_for_agv_locked(agv.aid)
-                publish_stop = True
+                    next_action = (
+                        "requeue", task, f"charge navigation status {status}")
             elif agv.state == State.RETURNING:
-                # Home trip finished (or aborted) — park and become idle.
-                agv.state = State.IDLE
-                agv.task = None
-                agv.current_goal_xy = None
-                agv.current_goal_yaw = 0.0
-                agv.resume_state = State.IDLE
-                agv.resume_goal_xy = None
-                agv.wait_point_xy = None
-                agv.wait_reason = ""
-                agv.wait_zone = ""
-                agv.yielding_to = ""
-                self._release_route_locked(agv.aid)
-                self._clear_conflict_locks_for_agv_locked(agv.aid)
-                publish_stop = True
+                if status == GoalStatus.STATUS_SUCCEEDED:
+                    # Home trip finished — park and become idle.
+                    agv.state = State.IDLE
+                    agv.task = None
+                    agv.current_goal_xy = None
+                    agv.current_goal_yaw = 0.0
+                    agv.resume_state = State.IDLE
+                    agv.resume_goal_xy = None
+                    agv.wait_point_xy = None
+                    agv.wait_reason = ""
+                    agv.wait_zone = ""
+                    agv.yielding_to = ""
+                    self._release_route_locked(agv.aid)
+                    self._clear_conflict_locks_for_agv_locked(agv.aid)
+                    publish_stop = True
+                else:
+                    next_action = (
+                        "requeue", task, f"return navigation status {status}")
             elif status != GoalStatus.STATUS_SUCCEEDED:
                 next_action = ("requeue", task, f"navigation status {status}")
             elif agv.state == State.TO_SHELF:
@@ -1610,12 +1641,51 @@ class AGVScheduler(Node):
             )
             return
 
+    def _internal_stage_for_task(self, task: Task) -> Optional[State]:
+        if task.tid.startswith("CHARGE_"):
+            return State.TO_CHARGE
+        if task.tid.startswith("RETURN_"):
+            return State.RETURNING
+        return None
+
+    def _set_internal_retry_wait_locked(
+            self,
+            agv: AGVState,
+            task: Task,
+            reason: str,
+            retry_delay: float = 5.0):
+        stage = self._internal_stage_for_task(task)
+        if not stage:
+            return
+        goal_xy, goal_yaw, _ = self._goal_for_state(task, stage)
+        agv.state = State.WAITING
+        agv.task = task
+        agv.current_goal_handle = None
+        agv.current_goal_xy = None
+        agv.current_goal_yaw = 0.0
+        agv.nav_goal_sent_ts = 0.0
+        agv.nav_goal_accepted_ts = 0.0
+        agv.resume_state = stage
+        agv.resume_goal_xy = goal_xy
+        agv.resume_goal_yaw = goal_yaw
+        agv.wait_until = time.time() + retry_delay
+        agv.wait_point_xy = None
+        agv.wait_point_yaw = 0.0
+        agv.wait_reason = "internal_retry"
+        agv.wait_zone = reason
+        agv.yielding_to = ""
+        task.status = f"waiting:{reason}"
+
     def _return_task_to_queue(self, agv: AGVState, task: Task, reason: str):
         # CHARGE_/RETURN_ are internal moves, not real shelf tasks to requeue.
-        is_internal = task.tid.startswith(("CHARGE_", "RETURN_"))
+        internal_stage = self._internal_stage_for_task(task)
+        is_internal = internal_stage is not None
         with self.lock:
             current = self.agvs.get(agv.aid)
-            if current:
+            if current and is_internal:
+                self._set_internal_retry_wait_locked(current, task, reason)
+                self._clear_conflict_locks_for_agv_locked(current.aid)
+            elif current:
                 current.state = State.IDLE
                 current.task = None
                 current.current_goal_handle = None
@@ -1647,7 +1717,7 @@ class AGVScheduler(Node):
         self._publish_stop(agv.aid)
         if is_internal:
             self.get_logger().warn(
-                f"[ABORT] {agv.aid} internal move {task.tid}: {reason}")
+                f"[RETRY] {agv.aid} internal move {task.tid}: {reason}")
         else:
             self.get_logger().warn(f"[REQUEUE] {task.tid}: {reason}")
 
@@ -1699,6 +1769,7 @@ class AGVScheduler(Node):
                 blocker=other,
                 blocked_zone_ids={f"traffic:{zone}" for zone in conflict_zones},
                 hold_until=now + self.yield_hold_duration,
+                use_wait_point=False,
             )
             agv.current_goal_handle = None
             agv.current_goal_xy = None
@@ -1734,10 +1805,10 @@ class AGVScheduler(Node):
                     continue
                 if not agv.resume_goal_xy:
                     continue
+                if agv.wait_until > 0.0 and now < agv.wait_until:
+                    continue
 
                 if agv.wait_reason == "yield":
-                    if now < agv.wait_until:
-                        continue
                     blocker = self.agvs.get(agv.yielding_to)
                     if blocker:
                         dist = math.hypot(agv.x - blocker.x, agv.y - blocker.y)

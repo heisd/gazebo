@@ -132,7 +132,8 @@ base_frames:
 
 1. 主逻辑：区域预约
    - 任务分配前或阶段切换前，如果目标阶段资源被占用，车辆进入 `WAITING`
-   - 若配置了等待点，会先导航到等待点再排队恢复
+   - reservation wait 默认原地停止并重试；避免把等待点路径变成未预约的
+     隐式导航
 2. 最后安全层：近距离让行
    - 当两车距离小于 `safety_stop_distance` 时，仍会触发强制让行
    - 但 winner / loser 会在一次冲突周期内锁定，避免来回震荡
@@ -145,7 +146,8 @@ base_frames:
 4. 两方都有任务 → 低优先级让行。
 5. 优先级相同 → agv_id 较大的让行（通常 `agv_02`）。
 
-等待点到达后，旧预约会主动释放；恢复任务前会重新为当前阶段申请资源。这比单纯靠 `route_hold_timeout` 过期释放更安全。
+恢复任务前会重新为当前阶段申请资源。当前默认不再为 reservation/yield
+等待发送未预约的 wait-point 导航目标，而是原地保持并等待预约重试。
 
 ## 预约保活
 
@@ -190,19 +192,22 @@ pose_stale_timeout: 8.0
 **消耗逻辑：**
 - 运动中（`|vx| > 0.01` 或 `|wz| > 0.01`）：每秒扣 `battery_drain_moving`%
 - 静止时：每秒扣 `battery_drain_idle`%
-- 前往充电站途中（`TO_CHARGE`）正常消耗，不再触发阈值检查
+- 前往充电站途中（`TO_CHARGE`）或等待 `CHARGE_` 内部任务重试时正常消耗，
+  不再重复触发新的充电中断
 
 **充电触发（最高优先级）：**
 
 | 条件 | 行为 | 入口方法 |
 |---|---|---|
-| 电量 < `battery_critical_threshold`（10%），任意状态 | 立刻中断当前任务，任务重新入队，直接去充电站 | `_emergency_charge` |
-| 电量 < `battery_low_threshold`（20%），`state == IDLE` | 正常发起充电导航 | `_send_to_charge` |
+| 电量 < `battery_critical_threshold`（10%），任意状态 | 立刻中断当前任务，任务重新入队，先预约去充电站的路线；若被阻塞则原地等待重试 | `_emergency_charge` |
+| 电量 < `battery_low_threshold`（20%），`state == IDLE` | 创建 `CHARGE_` 内部任务，预约充电路线后再发导航 | `_send_to_charge` |
 
 `_emergency_charge` 原子地完成以下操作（持锁）：
 1. 取消当前 Nav2 goal handle
 2. 将被中断任务置回 `pending`，`retry_after + 10s` 后重新参与调度
-3. 将 AGV 状态切换为 `TO_CHARGE`，下发充电导航目标
+3. 创建 `CHARGE_<agv_id>` 内部任务，通过 `_prepare_stage_dispatch_locked()` /
+   `_reserve_stage_locked()` 申请充电路线；预约成功后才下发 Nav2 目标，
+   被阻塞或 Nav2 暂不可用时进入 `WAITING` 原地重试
 
 充电到达后 `state` 切换为 `CHARGING`，每秒回复 `battery_charge_rate`%，达到 `battery_full_threshold` 后回 `IDLE`。
 
@@ -222,7 +227,8 @@ battery_min_dispatch: 15.0       # 低于此电量不再派发新任务 (%)
 `two_agv_scheduler.yaml` 里配置；`_sched_loop` 只会把电量高于该阈值的空闲车
 纳入候选。
 
-充电任务（tid = `CHARGE_<agv_id>`）不进入普通任务队列；`_return_task_to_queue` 识别 `CHARGE_` 前缀并跳过重入队。
+充电任务（tid = `CHARGE_<agv_id>`）不进入普通任务队列；`_return_task_to_queue`
+识别 `CHARGE_` 前缀并保留内部任务等待重试，不会把它加入普通货架任务队列。
 
 ## 停靠等待
 
@@ -309,12 +315,14 @@ ros2 topic echo --field data /agv/scheduler_status
 
 返航任务 `tid = RETURN_<agv_id>`，`priority = 0`：
 
-- 不进入普通任务队列，`_return_task_to_queue` 识别 `RETURN_` 前缀跳过重入队；
+- 不进入普通任务队列，`_return_task_to_queue` 识别 `RETURN_` 前缀并保留内部
+  任务等待重试，不会加入普通货架任务队列；
 - 和普通阶段一样先通过 `_prepare_stage_dispatch_locked()` /
   `_reserve_stage_locked()` 申请返航路径，确保 `reserved_zones` 与
   `route_reservations` 覆盖离开 dock、穿过 `station_lane`、回到 home 的
-  整段路线；若返航路径被预约阻塞，AGV 原地等待并重试，不会把 home/parking
-  wait point 当成未预约的等待导航目标；
+  整段路线；若返航路径被预约阻塞或 Nav2 失败，AGV 原地等待并重试，
+  不会把 home/parking wait point 当成未预约的等待导航目标，也不会把失败的
+  返航直接当作已到家处理；
 - 现有路权规则会让低优先级（0）的返航车给真实任务让行，无需改安全逻辑；
 - `RETURNING` 车（以及等待返航预约的 `RETURN_` 内部任务）仍可被调度：若队列有待办任务，
   `_sched_loop` 会中断返航直接接新任务（取消 home/等待目标），避免繁忙时浪费返航行程。
