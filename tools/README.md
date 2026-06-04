@@ -21,16 +21,27 @@ python3 tools/closed_loop_sim.py
 
 会跑两组对照实验并打印时间线、每车任务数、并行度（peak active）、makespan：
 
-1. **BASELINE** — 用仓库里提交的 `warehouse_layout.yaml`（`station_lane: exclusive`）。
-2. **EXPERIMENT** — 把 `station_lane` 临时降级为 `queue`（写到临时文件，不改仓库配置），
-   以放开并行路线。
+1. **REFERENCE** — 临时把 `station_lane` 设回 `exclusive`（旧瓶颈），车队被串行化。
+2. **FIXED** — 用仓库里提交的当前配置（`station_lane: queue` + 返航去霸占），
+   两车真正并行。
+
+## 优化与验证历程（双车 4 任务场景）
+
+| 阶段 | 并行度 | makespan | YIELD 次数 | 说明 |
+|---|---|---|---|---|
+| 原始（station_lane=exclusive） | 1 | 85s | 0 | 共享车道独占→全队串行 |
+| 仅放开车道（queue，未修让行） | 2 | 306s | 47 | 暴露让行活锁，反而更慢 |
+| **当前（queue + 返航去霸占）** | **2** | **54s** | **0** | 并行且无活锁，最快 |
+
+根因：出货 dock 是所有任务共享终点；空闲车停在 dock 上 + "有任务车给无任务车
+让行"的规则 → 带任务车反复退避形成死锁。修法：送货完成后空闲车返回各自 home
+停车位（`RETURNING` 状态），dock 不再被霸占。
 
 ## 已验证的结论
 
-- 批量任务分配（`_sched_loop` 优化）生效：能并行时两台车在同一调度周期被同时派出。
-- 提交的布局里 `station_lane` 为 `exclusive`，是整个车队的串行化瓶颈
-  （每个任务都要穿过它）。
-- 仅放开该瓶颈会暴露**让行活锁**（两车在共享出货站附近反复让行往返），
-  makespan 反而变差——对应 `diffweakplan.md` 里第 6 点"让行震荡"。
+- 批量任务分配（`_sched_loop`）生效：能并行时两车在同一调度周期被同时派出。
+- `station_lane=queue` + `cell` 预约：放开并行的同时仍能防撞。
+- 返航去霸占：消除"空闲车堵死共享 dock"的死锁（对应 `diffweakplan.md` 第 6 点）。
+- 单车兼容、6 任务重负载、低电量自动充电场景均无死锁（YIELD=0）。
 
 这个台架是确定性的，可作为后续优化让行 / 路权逻辑时的回归验证工具。

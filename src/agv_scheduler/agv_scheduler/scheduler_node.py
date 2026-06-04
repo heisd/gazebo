@@ -42,6 +42,7 @@ class State(Enum):
     DELIVERING = "delivering"
     TO_CHARGE = "to_charge"
     CHARGING = "charging"
+    RETURNING = "returning"
     WAITING = "waiting"
     ERROR = "error"
 
@@ -734,6 +735,8 @@ class AGVScheduler(Node):
             return self.station_xy, 0.0, "station"
         if state == State.TO_CHARGE:
             return self.charging_xy, 0.0, "charging"
+        if state == State.RETURNING:
+            return task.pick_xy, task.pick_yaw, "home"
         raise ValueError(f"Unsupported stage goal for state {state.value}")
 
     def _route_points_for_stage(
@@ -1219,9 +1222,11 @@ class AGVScheduler(Node):
         with self.lock:
             self._cleanup_route_reservations_locked()
             now = time.time()
+            # RETURNING AGVs are still available: a pending task can interrupt
+            # the home trip so a backlog never wastes a return leg.
             idle = [
                 agv for agv in self.agvs.values()
-                if agv.state == State.IDLE
+                if agv.state in (State.IDLE, State.RETURNING)
                 and agv.battery > self.battery_min_dispatch
             ]
             if not self.queue or not idle:
@@ -1245,6 +1250,7 @@ class AGVScheduler(Node):
                 candidates.sort(
                     key=lambda agv: self._assignment_cost(agv, task))
                 for agv in candidates:
+                    old_handle = agv.current_goal_handle
                     prep = self._prepare_stage_dispatch_locked(
                         agv,
                         task,
@@ -1260,7 +1266,7 @@ class AGVScheduler(Node):
                     agv.task = task
                     assigned_agvs.add(agv.aid)
                     assigned_tids.add(task.tid)
-                    assignments.append((agv.aid, task, prep))
+                    assignments.append((agv.aid, task, prep, old_handle))
                     break
 
             if assigned_tids:
@@ -1269,8 +1275,11 @@ class AGVScheduler(Node):
                     if task.tid not in assigned_tids
                 ]
 
-        for aid, task, prep in assignments:
+        for aid, task, prep, old_handle in assignments:
             agv = self.agvs[aid]
+            if old_handle is not None:
+                # interrupt an in-progress return-home trip before re-tasking
+                old_handle.cancel_goal_async()
             self.get_logger().info(
                 f"[ASSIGN] {task.tid} -> {aid} shelf={task.shelf} "
                 f"center=({task.shelf_center_xy[0]:.1f},"
@@ -1422,6 +1431,21 @@ class AGVScheduler(Node):
                 self._release_route_locked(agv.aid)
                 self._clear_conflict_locks_for_agv_locked(agv.aid)
                 publish_stop = True
+            elif agv.state == State.RETURNING:
+                # Home trip finished (or aborted) — park and become idle.
+                agv.state = State.IDLE
+                agv.task = None
+                agv.current_goal_xy = None
+                agv.current_goal_yaw = 0.0
+                agv.resume_state = State.IDLE
+                agv.resume_goal_xy = None
+                agv.wait_point_xy = None
+                agv.wait_reason = ""
+                agv.wait_zone = ""
+                agv.yielding_to = ""
+                self._release_route_locked(agv.aid)
+                self._clear_conflict_locks_for_agv_locked(agv.aid)
+                publish_stop = True
             elif status != GoalStatus.STATUS_SUCCEEDED:
                 next_action = ("requeue", task, f"navigation status {status}")
             elif agv.state == State.TO_SHELF:
@@ -1465,7 +1489,9 @@ class AGVScheduler(Node):
                 task.status = "done"
                 self.get_logger().info(
                     f"[DONE] {task.tid} completed by {agv.aid}")
-                return
+                # Vacate the shared station: head home instead of idling on
+                # the dock (an idle AGV on a shared goal deadlocks others).
+                next_action = ("return_home", None, None)
             else:
                 return
 
@@ -1479,6 +1505,9 @@ class AGVScheduler(Node):
 
         if not next_action:
             return
+        if next_action[0] == "return_home":
+            self._start_return_home(self.agvs[aid])
+            return
         if next_action[0] == "requeue":
             _, task, reason = next_action
             self._return_task_to_queue(self.agvs[aid], task, reason)
@@ -1486,6 +1515,49 @@ class AGVScheduler(Node):
 
         _, task, prep = next_action
         self._execute_prepared_stage(self.agvs[aid], task, prep)
+
+    def _home_wait_point(self, agv: AGVState) -> Optional[WaitPoint]:
+        wp = self.global_wait_points.get(f"parking_{agv.aid}")
+        if wp:
+            return wp
+        return self._select_wait_point(agv)
+
+    def _start_return_home(self, agv: AGVState):
+        home = self._home_wait_point(agv)
+        if not home:
+            self._publish_stop(agv.aid)
+            return
+        if math.hypot(agv.x - home.xy[0],
+                      agv.y - home.xy[1]) <= self.wait_point_tolerance:
+            self._publish_stop(agv.aid)
+            return
+        return_task = Task(
+            tid=f"RETURN_{agv.aid}",
+            shelf="",
+            shelf_center_xy=home.xy,
+            pick_xy=home.xy,
+            pick_yaw=home.yaw,
+            aisle_exit_xy=home.xy,
+            drop_xy=home.xy,
+            priority=0,
+            agv=agv.aid,
+            status="returning",
+        )
+        with self.lock:
+            if agv.state != State.IDLE or agv.task is not None:
+                return
+            agv.state = State.RETURNING
+            agv.task = return_task
+        if not self._send_nav(home.xy, home.yaw, return_task, agv):
+            with self.lock:
+                if agv.state == State.RETURNING:
+                    agv.state = State.IDLE
+                    agv.task = None
+            self._publish_stop(agv.aid)
+            return
+        self.get_logger().info(
+            f"[RETURN] {agv.aid} delivered, returning home to "
+            f"({home.xy[0]:.1f},{home.xy[1]:.1f})")
 
     def _execute_prepared_stage(self, agv: AGVState, task: Task, prep: dict):
         action = prep.get("action")
@@ -1510,7 +1582,8 @@ class AGVScheduler(Node):
             return
 
     def _return_task_to_queue(self, agv: AGVState, task: Task, reason: str):
-        is_charge_task = task.tid.startswith("CHARGE_")
+        # CHARGE_/RETURN_ are internal moves, not real shelf tasks to requeue.
+        is_internal = task.tid.startswith(("CHARGE_", "RETURN_"))
         with self.lock:
             current = self.agvs.get(agv.aid)
             if current:
@@ -1534,7 +1607,7 @@ class AGVScheduler(Node):
                 current.yield_cooldown_until = 0.0
                 self._release_route_locked(current.aid)
                 self._clear_conflict_locks_for_agv_locked(current.aid)
-            if not is_charge_task:
+            if not is_internal:
                 task.status = "pending"
                 task.agv = ""
                 task.last_error = reason
@@ -1543,8 +1616,9 @@ class AGVScheduler(Node):
                     self.queue.append(task)
                     self.queue.sort()
         self._publish_stop(agv.aid)
-        if is_charge_task:
-            self.get_logger().warn(f"[CHARGE] {agv.aid} charge trip aborted: {reason}")
+        if is_internal:
+            self.get_logger().warn(
+                f"[ABORT] {agv.aid} internal move {task.tid}: {reason}")
         else:
             self.get_logger().warn(f"[REQUEUE] {task.tid}: {reason}")
 
@@ -1554,7 +1628,8 @@ class AGVScheduler(Node):
         task = agv.task
         if not task:
             return None, 0.0
-        if agv.state in (State.TO_SHELF, State.TO_AISLE_EXIT, State.TO_STATION):
+        if agv.state in (State.TO_SHELF, State.TO_AISLE_EXIT,
+                         State.TO_STATION, State.RETURNING):
             goal_xy, goal_yaw, _ = self._goal_for_state(task, agv.state)
             return goal_xy, goal_yaw
         if agv.state == State.WAITING and agv.resume_goal_xy:

@@ -191,6 +191,11 @@ yield_cooldown_duration: 3.0
 
 让行中的车辆会在 `/agv/scheduler_status` 里显示 `state: "waiting"`、`yielding_to`、`wait_reason`、`wait_point` 和 `resume_goal`。
 
+**送货后返航（避免霸占共享 dock）：** 任务送达出货站后，车辆不会空闲滞留在
+dock 上，而是进入 `RETURNING` 返回各自 home 停车位（`wait_points.parking_<agv_id>`）
+再转 `IDLE`。否则空闲车堵在共享 dock 上会让另一台带任务的车反复让行直至死锁。
+返航任务优先级为 0，会给真实任务让路；若队列有待办，调度器会中断返航直接接新单。
+
 ## 交通区与等待点
 
 调度器会从 `src/agv_scheduler/config/warehouse_layout.yaml` 读取交通区：
@@ -200,7 +205,7 @@ traffic_zones:
   main_corridor:
     type: exclusive
   station_lane:
-    type: exclusive
+    type: queue
   station_queue:
     type: queue
 ```
@@ -208,7 +213,11 @@ traffic_zones:
 含义：
 
 - `exclusive`: 同一时刻只允许一台车占用
-- `queue`: 主要用于排队可视化和等待点选择，不做强互斥
+- `queue`: 主要用于排队可视化和等待点选择，不做强互斥；车道内防撞依赖更细粒度的 `cell` 预约
+
+> `station_lane` 之所以是 `queue` 而不是 `exclusive`：每个任务都必须穿过这条
+> 纵向车道，如果整条独占，两台车永远无法并行（实测会把双车 makespan 从 54s
+> 拖到 85s）。改 `queue` 后由 `cell` 预约保证不撞，同时放开并行。
 
 每个关键区都可以配置 `wait_points.agv_01`、`wait_points.agv_02`。当某台车因为阶段预约失败或近距离让行需要退出冲突区时，调度器会优先把它送到这些固定安全点。
 

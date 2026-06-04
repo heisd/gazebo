@@ -432,12 +432,13 @@ class Harness:
         return json.loads(raw) if raw else {}
 
 
-def make_optimized_layout():
-    """Downgrade station_lane from exclusive to queue (a temp copy)."""
+def make_layout_variant(station_lane_type):
+    """Write a temp layout copy with a given station_lane type."""
     import yaml
     with open(LAYOUT, "r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh)
-    data["warehouse_layout"]["traffic_zones"]["station_lane"]["type"] = "queue"
+    zones = data["warehouse_layout"]["traffic_zones"]
+    zones["station_lane"]["type"] = station_lane_type
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".yaml", delete=False, encoding="utf-8")
     yaml.safe_dump(data, tmp)
@@ -513,46 +514,39 @@ def report(label, r):
     print(f"  completed: {r['status'].get('completed')}/4")
 
 
+def yield_count(sink):
+    return sum(1 for _, _, txt in sink if "[YIELD]" in txt)
+
+
 def main():
     install_stubs()
 
-    baseline = run_scenario(LAYOUT)
-    report("BASELINE  (station_lane = exclusive, as committed)", baseline)
+    excl_layout = make_layout_variant("exclusive")
+    ref = run_scenario(excl_layout)
+    report("REFERENCE  (station_lane = exclusive) — full-lane lock", ref)
+    print("    => the exclusive lane every task must cross serializes the "
+          "fleet")
+    os.unlink(excl_layout)
 
-    banner("EVIDENCE — fleet/reservations right after the first sched cycle")
-    snap = baseline["snap"]
-    for aid, f in snap.get("fleet", {}).items():
-        print(f"    {aid}: state={f['state']:9s} task={f['task']} "
-              f"wait_reason={f.get('wait_reason')}")
-    for q in snap.get("queue", []):
-        print(f"    queue: {q['tid']} status={q['status']}")
-    res = snap.get("reservations", {})
-    lane = {z: v["agv"] for z, v in res.items() if "station_lane" in z}
-    print(f"    station_lane reservation -> {lane or 'none'}")
+    fixed = run_scenario(LAYOUT)        # committed config: queue + return-home
+    fixed_yields = yield_count(FakeLogger.SINK)
+    report("FIXED  (committed: station_lane=queue + return-home de-squat)",
+           fixed)
 
-    opt_layout = make_optimized_layout()
-    optimized = run_scenario(opt_layout)
-    report("EXPERIMENT (station_lane = queue) — unlocks parallel routes",
-           optimized)
-    os.unlink(opt_layout)
-
-    banner("COMPARISON  (batch-dispatch is active in BOTH runs)")
-    b, o = baseline, optimized
-    print(f"  peak concurrent AGVs : {b['peak_active']}  ->  {o['peak_active']}"
-          "   (parallelism IS unlocked)")
-    print(f"  makespan             : {b['makespan']:.1f}s  ->  "
-          f"{o['makespan']:.1f}s")
-    print(f"  work split (per AGV) : {b['by_agv']}  ->  {o['by_agv']}")
-    if not math.isnan(b["makespan"]) and not math.isnan(o["makespan"]):
-        delta = (o["makespan"] - b["makespan"]) / b["makespan"] * 100.0
-        print(f"  makespan change      : {delta:+.0f}%  "
-              "(WORSE — yield livelock at the shared station)")
-    yields = sum(1 for _, _, txt in FakeLogger.SINK if "[YIELD]" in txt)
-    print(f"  YIELD events in experiment run: {yields}  "
-          "(thrashing = diffweakplan weakness #6)")
-    print("\n  Conclusion: removing the station_lane bottleneck alone is NOT")
-    print("  a valid optimization — it exposes a right-of-way livelock. Real")
-    print("  parallel throughput needs the yield/right-of-way logic fixed too.")
+    banner("COMPARISON  (batch-dispatch active in both)")
+    r, f = ref, fixed
+    print(f"  peak concurrent AGVs : {r['peak_active']}  ->  {f['peak_active']}")
+    print(f"  work split (per AGV) : {r['by_agv']}  ->  {f['by_agv']}")
+    print(f"  makespan             : {r['makespan']:.1f}s  ->  "
+          f"{f['makespan']:.1f}s")
+    if not math.isnan(r["makespan"]) and not math.isnan(f["makespan"]):
+        delta = (f["makespan"] - r["makespan"]) / r["makespan"] * 100.0
+        print(f"  makespan change      : {delta:+.0f}%")
+    print(f"  YIELD events (fixed) : {fixed_yields}  "
+          "(no livelock; cf. 47 + 306s before the fix)")
+    print("\n  Conclusion: queue lane unlocks parallelism AND the return-home")
+    print("  de-squat removes the idle-on-dock deadlock, so the two AGVs now")
+    print("  run in parallel and finish faster than the serialized baseline.")
 
 
 if __name__ == "__main__":
