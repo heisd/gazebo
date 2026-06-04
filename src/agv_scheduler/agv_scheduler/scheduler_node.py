@@ -1575,6 +1575,13 @@ class AGVScheduler(Node):
                 f"{prep.get('blocker', 'traffic')}")
         self._execute_prepared_stage(agv, return_task, prep)
 
+    def _wait_should_hold_position(self, task: Task, prep: dict) -> bool:
+        # RETURN_ waits are created when the return-home route reservation is
+        # blocked.  In the shipped layout, the configured wait points for the
+        # station lane are the same parking points used as home positions, so
+        # sending a wait-point Nav2 goal would bypass the failed reservation.
+        return bool(prep.get("hold_position") or task.tid.startswith("RETURN_"))
+
     def _execute_prepared_stage(self, agv: AGVState, task: Task, prep: dict):
         action = prep.get("action")
         if action == "dispatch":
@@ -1587,7 +1594,7 @@ class AGVScheduler(Node):
 
         if action == "wait":
             blocker = prep.get("blocker", "traffic")
-            if prep.get("hold_position"):
+            if self._wait_should_hold_position(task, prep):
                 self._publish_stop(agv.aid)
                 self.get_logger().warn(
                     f"[WAIT] {agv.aid} holds position for "
