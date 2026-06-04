@@ -80,6 +80,57 @@ def load_layout():
 
 
 # --------------------------------------------------------------------------
+# Conflict scenarios — deliberately put the two AGVs on crossing paths so the
+# reservation / right-of-way machinery has to resolve the contention.  Each is
+# just an ordered list of operator commands, so it behaves identically whether
+# the panel is driving the in-process sim or a live ROS scheduler.
+# --------------------------------------------------------------------------
+SCENARIOS = {
+    "cross": {
+        "label": "Cross-corridor tasks",
+        "desc": "Pins opposite-side shelf jobs to each AGV (agv_01→D1 south, "
+                "agv_02→A1 north). Both must traverse the central EXCLUSIVE "
+                "corridor on crossing paths and then share the delivery dock. "
+                "Resolution: the corridor reservation serialises them and the "
+                "loser retreats to a wait point — both jobs still complete.",
+        "commands": [
+            {"cmd": "task", "shelf": "D1", "priority": 6, "agv_id": "agv_01"},
+            {"cmd": "task", "shelf": "A1", "priority": 6, "agv_id": "agv_02"},
+        ],
+    },
+    "headon": {
+        "label": "Head-on goto",
+        "desc": "Mirror-image manual moves (agv_01→(-9,-5), agv_02→(-9,5)) "
+                "that cross inside the corridor. Resolution: one AGV reserves "
+                "the corridor and crosses while the other holds in place, then "
+                "resumes once it clears — no collision, no deadlock.",
+        "commands": [
+            {"cmd": "goto", "agv_id": "agv_01", "x": -9.0, "y": -5.0},
+            {"cmd": "goto", "agv_id": "agv_02", "x": -9.0, "y": 5.0},
+        ],
+    },
+    "reset": {
+        "label": "Reset → home",
+        "desc": "Stop both AGVs and send them back to their home parking "
+                "spots, ready to re-run a scenario.",
+        "commands": [
+            {"cmd": "return", "agv_id": "agv_01"},
+            {"cmd": "return", "agv_id": "agv_02"},
+        ],
+    },
+}
+
+
+def run_scenario(backend, name):
+    sc = SCENARIOS.get(name)
+    if not sc:
+        return {"ok": False, "error": f"unknown scenario '{name}'"}
+    for cmd in sc["commands"]:
+        backend.command(dict(cmd))
+    return {"ok": True, "ran": name, "commands": len(sc["commands"])}
+
+
+# --------------------------------------------------------------------------
 # SIM backend: real scheduler logic behind the closed-loop ROS stubs
 # --------------------------------------------------------------------------
 class SimBackend:
@@ -143,12 +194,18 @@ class SimBackend:
     def start(self):
         self._thread.start()
 
-    def step_for(self, sim_seconds):
-        """Advance the sim deterministically (used by the verifier)."""
+    def step_for(self, sim_seconds, on_tick=None):
+        """Advance the sim deterministically (used by the verifier).
+
+        ``on_tick`` (if given) is called with this backend after every tick so
+        a caller can audit per-tick invariants (e.g. conflict resolution).
+        """
         ticks = int(round(sim_seconds / self.dt))
         for _ in range(ticks):
             with self.lock:
                 self._tick()
+            if on_tick is not None:
+                on_tick(self)
 
     # -- operator interface -------------------------------------------------
     def command(self, payload):
@@ -238,13 +295,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, INDEX_HTML, "text/html; charset=utf-8")
         elif self.path == "/api/layout":
             self._send(200, json.dumps(self.layout))
+        elif self.path == "/api/scenarios":
+            self._send(200, json.dumps({
+                k: {"label": v["label"], "desc": v["desc"]}
+                for k, v in SCENARIOS.items()}))
         elif self.path == "/api/status":
             self._send(200, json.dumps(self.backend.status()))
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
-        if self.path != "/api/command":
+        if self.path not in ("/api/command", "/api/scenario"):
             self._send(404, json.dumps({"error": "not found"}))
             return
         length = int(self.headers.get("Content-Length", 0))
@@ -255,7 +316,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"error": f"bad json: {exc}"}))
             return
         try:
-            result = self.backend.command(payload)
+            if self.path == "/api/scenario":
+                result = run_scenario(self.backend, payload.get("name", ""))
+            else:
+                result = self.backend.command(payload)
             self._send(200, json.dumps(result))
         except Exception as exc:
             self._send(500, json.dumps({"error": str(exc)}))
@@ -366,6 +430,11 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
     <div class="card">
+      <h2>Conflict tests <span class="small">(force a path conflict)</span></h2>
+      <div class="seg" id="scenarios" style="flex-wrap:wrap"></div>
+      <div id="scDesc" class="small" style="margin-top:8px;min-height:32px"></div>
+    </div>
+    <div class="card">
       <h2>Task queue (<span id="pending">0</span>)</h2>
       <table id="queue"><tbody></tbody></table>
     </div>
@@ -390,8 +459,26 @@ async function init(){
   BOUNDS={minx:Math.min(...xs)-1.5,maxx:Math.max(...xs)+1.5,
           miny:Math.min(...ys)-1.5,maxy:Math.max(...ys)+1.5};
   $('#map').addEventListener('click',onMapClick);
+  await initScenarios();
   poll();
   setInterval(poll, 500);
+}
+async function initScenarios(){
+  let sc; try{sc=await (await fetch('/api/scenarios')).json();}catch(e){return;}
+  const box=$('#scenarios');box.innerHTML='';
+  for(const [name,info] of Object.entries(sc)){
+    const b=document.createElement('button');
+    b.textContent=info.label;
+    b.onmouseenter=()=>{$('#scDesc').textContent=info.desc;};
+    b.onclick=()=>runScenario(name,info);
+    box.appendChild(b);
+  }
+}
+async function runScenario(name,info){
+  $('#scDesc').textContent='▶ '+info.label+': '+info.desc;
+  await fetch('/api/scenario',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name})});
 }
 function W2C(x,y){
   const c=$('#map'),pad=8;
@@ -454,8 +541,13 @@ function renderFleet(st){
   for(const [a,f] of Object.entries(st.fleet||{})){
     const tr=document.createElement('tr');
     const bcol=f.battery<10?'var(--warn)':f.battery<20?'#ffb74d':'var(--txt)';
+    let note='';
+    if(f.yielding_to)
+      note=`<span class="pill" style="background:#5a3a00">⤳ ${f.yielding_to}</span>`;
+    else if(f.wait_reason)
+      note=`<span class="pill" style="background:#3a2a4a">⏸ ${f.wait_reason}</span>`;
     tr.innerHTML=`<td><span style="color:${COL[a]||'#fff'}">●</span> ${a}</td>
-      <td><span class="pill">${f.state}</span></td>
+      <td><span class="pill">${f.state}</span> ${note}</td>
       <td class="bat" style="color:${bcol}">${f.battery}%</td>
       <td>${f.task||'<span class=k>—</span>'}</td>
       <td class="small">${f.pos?f.pos[0]+', '+f.pos[1]:''}</td>`;

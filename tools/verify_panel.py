@@ -19,7 +19,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 
-from control_panel import SimBackend  # noqa: E402
+from control_panel import SimBackend, run_scenario  # noqa: E402
 
 RESULTS = []
 
@@ -282,6 +282,60 @@ def test_fix6_internal_retry_backoff_rearm():
           f"deadline {first_deadline}->{a1.wait_until} now={b.sim.SimClock.t}")
 
 
+def _corridor_poly(sched):
+    z = sched.traffic_zones.get("main_corridor")
+    return z.polygon if z else None
+
+
+def test_conflict_cross_tasks():
+    """Opposite-side jobs force a corridor crossing; both must still finish
+    and the two AGVs must never co-occupy the exclusive corridor."""
+    b = fresh()
+    s = b.sched
+    poly = _corridor_poly(s)
+    state = {"breach": 0, "minsep": 1e9}
+
+    def audit(_bk):
+        a1, a2 = s.agvs["agv_01"], s.agvs["agv_02"]
+        if (s._point_in_polygon((a1.x, a1.y), poly)
+                and s._point_in_polygon((a2.x, a2.y), poly)):
+            state["breach"] += 1
+        state["minsep"] = min(state["minsep"], dist((a1.x, a1.y), (a2.x, a2.y)))
+
+    run_scenario(b, "cross")
+    b.step_for(300, on_tick=audit)
+    st = b.status()
+    check("conflict[cross]: both opposite-side jobs complete (no deadlock)",
+          st["completed"] >= 2, f"completed={st['completed']}")
+    check("conflict[cross]: exclusive corridor never co-occupied "
+          "(collision-free)", state["breach"] == 0,
+          f"co-occupied_ticks={state['breach']} min_sep={state['minsep']:.2f}m")
+
+
+def test_conflict_headon_goto():
+    """Mirror-image manual moves cross in the corridor; one holds while the
+    other passes, then both reach their targets."""
+    b = fresh()
+    s = b.sched
+    poly = _corridor_poly(s)
+    state = {"breach": 0}
+
+    def audit(_bk):
+        a1, a2 = s.agvs["agv_01"], s.agvs["agv_02"]
+        if (s._point_in_polygon((a1.x, a1.y), poly)
+                and s._point_in_polygon((a2.x, a2.y), poly)):
+            state["breach"] += 1
+
+    run_scenario(b, "headon")
+    b.step_for(260, on_tick=audit)
+    a1, a2 = s.agvs["agv_01"], s.agvs["agv_02"]
+    reached = (dist((a1.x, a1.y), (-9.0, -5.0)) < 0.6
+               and dist((a2.x, a2.y), (-9.0, 5.0)) < 0.6)
+    check("conflict[headon]: both manual moves reach targets, serialised",
+          reached and state["breach"] == 0,
+          f"reached={reached} co-occupied_ticks={state['breach']}")
+
+
 def main():
     print("=" * 70)
     print("AGV control-panel + bug-fix closed-loop verification")
@@ -298,6 +352,9 @@ def main():
     test_fix4_kind_discrimination()
     test_fix5_completed_counter_and_bounded_history()
     test_fix6_internal_retry_backoff_rearm()
+    print("\n-- Conflict resolution (deliberate path conflicts) --")
+    test_conflict_cross_tasks()
+    test_conflict_headon_goto()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     total = len(RESULTS)
