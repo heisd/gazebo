@@ -109,6 +109,18 @@ SCENARIOS = {
             {"cmd": "goto", "agv_id": "agv_02", "x": -9.0, "y": 5.0},
         ],
     },
+    "stress": {
+        "label": "Strong conflict (live yield)",
+        "desc": "Crosses the two AGVs through the NON-exclusive station_queue "
+                "(agv_01→(9,-1.5), agv_02→(9,1.5)) so they actually close to "
+                "<1 m while both are moving. Resolution exercises real-time "
+                "right-of-way: the loser YIELDS and retreats to a safe wait "
+                "point, then resumes — both still reach their targets.",
+        "commands": [
+            {"cmd": "goto", "agv_id": "agv_01", "x": 9.0, "y": -1.5},
+            {"cmd": "goto", "agv_id": "agv_02", "x": 9.0, "y": 1.5},
+        ],
+    },
     "reset": {
         "label": "Reset → home",
         "desc": "Stop both AGVs and send them back to their home parking "

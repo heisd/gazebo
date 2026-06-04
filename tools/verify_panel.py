@@ -336,6 +336,32 @@ def test_conflict_headon_goto():
           f"reached={reached} co-occupied_ticks={state['breach']}")
 
 
+def test_conflict_strong_yield():
+    """A crossing in the NON-exclusive station_queue must trigger a real-time
+    right-of-way yield (loser retreats to a wait point) and still resolve."""
+    b = fresh()
+    s = b.sched
+    sink = b.sim.FakeLogger.SINK
+    state = {"minsep": 1e9}
+
+    def audit(_bk):
+        a1, a2 = s.agvs["agv_01"], s.agvs["agv_02"]
+        state["minsep"] = min(state["minsep"], dist((a1.x, a1.y), (a2.x, a2.y)))
+
+    run_scenario(b, "stress")
+    b.step_for(140, on_tick=audit)
+    yields = sum(1 for _, _, t in sink if "[YIELD]" in t)
+    retreats = sum(1 for _, _, t in sink if "[WAIT]" in t and "->" in t)
+    a1, a2 = s.agvs["agv_01"], s.agvs["agv_02"]
+    reached = (dist((a1.x, a1.y), (9.0, -1.5)) < 0.6
+               and dist((a2.x, a2.y), (9.0, 1.5)) < 0.6)
+    check("conflict[strong]: real-time right-of-way YIELD fires (<safety dist)",
+          yields >= 1 and state["minsep"] < s.safety_stop_distance,
+          f"yields={yields} retreats={retreats} min_sep={state['minsep']:.2f}m")
+    check("conflict[strong]: both AGVs still reach targets after the yield",
+          reached, f"a1=({a1.x:.1f},{a1.y:.1f}) a2=({a2.x:.1f},{a2.y:.1f})")
+
+
 def main():
     print("=" * 70)
     print("AGV control-panel + bug-fix closed-loop verification")
@@ -355,6 +381,7 @@ def main():
     print("\n-- Conflict resolution (deliberate path conflicts) --")
     test_conflict_cross_tasks()
     test_conflict_headon_goto()
+    test_conflict_strong_yield()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     total = len(RESULTS)
