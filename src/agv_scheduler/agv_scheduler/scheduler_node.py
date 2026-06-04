@@ -15,6 +15,7 @@ import json
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Set, Tuple
@@ -63,6 +64,10 @@ class Task:
     status: str = "pending"
     retry_after: float = 0.0
     last_error: str = ""
+    # "shelf" = real pick-and-deliver job; "charge"/"return"/"manual" are
+    # scheduler-internal moves. This is authoritative instead of sniffing the
+    # tid prefix, which is operator/telemetry controlled.
+    kind: str = "shelf"
 
     def __lt__(self, other):
         return self.priority > other.priority
@@ -180,6 +185,10 @@ class AGVScheduler(Node):
     DEFAULT_STATION = (8.0, 0.0)
     DEFAULT_CHARGING = (9.0, -8.0)
     DEFAULT_AISLE_EXIT_X = 5.5
+    # tid prefixes reserved for scheduler-internal moves; external task ids
+    # may not use them so command routing/dedup can't be spoofed.
+    INTERNAL_TID_PREFIXES = ("CHARGE_", "RETURN_", "MANUAL_")
+    HISTORY_LIMIT = 200
 
     def __init__(self):
         super().__init__("agv_scheduler")
@@ -285,7 +294,11 @@ class AGVScheduler(Node):
             self.create_subscription(String, topic, self._on_status, 10)
 
         self.queue: List[Task] = []
-        self.history: List[Task] = []
+        # Bounded recent-task ring used only for duplicate-id rejection; the
+        # lifetime "completed" tally is a separate monotonic counter so
+        # trimming history can never make the count regress.
+        self.history: "deque[Task]" = deque(maxlen=self.HISTORY_LIMIT)
+        self._completed_count = 0
         self.route_reservations: Dict[str, RouteReservation] = {}
         self.conflict_locks: Dict[str, ConflictLock] = {}
         self.lock = threading.Lock()
@@ -294,6 +307,10 @@ class AGVScheduler(Node):
 
         self.create_subscription(
             String, "/agv/task_request", self._on_task, 10)
+        # Operator control channel (web panel / CLI): task | goto | charge |
+        # return | stop, addressed to a specific AGV.
+        self.create_subscription(
+            String, "/agv/agv_command", self._on_command, 10)
         self.pub_assign = self.create_publisher(
             String, "/agv/task_assigned", 10)
         self.pub_sched = self.create_publisher(
@@ -591,9 +608,14 @@ class AGVScheduler(Node):
             shelf_location = self.shelves[shelf]
 
             self._task_cnt += 1
-            tid = data.get("tid", f"T{self._task_cnt:04d}")
+            tid = str(data.get("tid", f"T{self._task_cnt:04d}"))
+            if tid.startswith(self.INTERNAL_TID_PREFIXES):
+                self.get_logger().warn(
+                    f"Task id {tid} uses a reserved internal prefix; ignored")
+                return
             task = Task(
                 tid=tid,
+                kind="shelf",
                 shelf=shelf,
                 shelf_center_xy=shelf_location.center_xy,
                 pick_xy=shelf_location.pick_xy,
@@ -625,6 +647,134 @@ class AGVScheduler(Node):
                 f"pending={len(self.queue)}")
         except Exception as exc:
             self.get_logger().error(f"Task parse failed: {exc}")
+
+    def _on_command(self, msg: String):
+        """Operator control channel (web panel / CLI).
+
+        Payload is JSON ``{"cmd": ..., "agv_id": ...}``:
+          * ``task``   – enqueue a shelf task (delegates to ``_on_task``);
+          * ``goto``   – drive one AGV straight to ``x, y[, yaw]`` and park;
+          * ``charge`` – send one AGV to the charger now;
+          * ``return`` – send one AGV home;
+          * ``stop``   – cancel the current goal and hold.
+        goto/charge/return/stop first force the AGV idle so the command is
+        honoured even mid-task; they all reuse the staged reservation path so
+        traffic control still applies.
+        """
+        try:
+            data = json.loads(msg.data)
+        except Exception as exc:
+            self.get_logger().warn(f"Command parse error: {exc}")
+            return
+        cmd = str(data.get("cmd", "")).strip().lower()
+        if cmd in ("", "task"):
+            self._on_task(msg)
+            return
+
+        aid = data.get("agv_id") or data.get("agv")
+        if aid not in self.agvs:
+            self.get_logger().warn(f"[CMD] {cmd}: unknown agv '{aid}'")
+            return
+        agv = self.agvs[aid]
+
+        if cmd == "goto":
+            try:
+                x = float(data["x"])
+                y = float(data["y"])
+            except (KeyError, TypeError, ValueError):
+                self.get_logger().warn("[CMD] goto requires numeric x and y")
+                return
+            yaw = float(data.get("yaw", 0.0))
+            self._manual_goto(agv, x, y, yaw)
+        elif cmd == "stop":
+            self._manual_stop(agv)
+        elif cmd in ("charge", "return"):
+            with self.lock:
+                goal_handle = self._force_idle_locked(agv)
+            if goal_handle:
+                goal_handle.cancel_goal_async()
+            if cmd == "charge":
+                self._send_to_charge(agv)
+            else:
+                self._start_return_home(agv)
+        else:
+            self.get_logger().warn(f"[CMD] unknown command '{cmd}'")
+
+    def _force_idle_locked(self, agv: AGVState):
+        """Reset an AGV to a clean idle state and return its old goal handle.
+
+        Bumps ``nav_goal_seq`` so any in-flight Nav2 callback for the cancelled
+        goal is ignored. Caller must cancel the returned handle outside the
+        lock.
+        """
+        goal_handle = agv.current_goal_handle
+        agv.nav_goal_seq += 1
+        agv.state = State.IDLE
+        agv.task = None
+        agv.current_goal_handle = None
+        agv.current_goal_xy = None
+        agv.current_goal_yaw = 0.0
+        agv.nav_goal_sent_ts = 0.0
+        agv.nav_goal_accepted_ts = 0.0
+        agv.pause_until = 0.0
+        agv.resume_state = State.IDLE
+        agv.resume_goal_xy = None
+        agv.resume_goal_yaw = 0.0
+        agv.wait_until = 0.0
+        agv.wait_point_xy = None
+        agv.wait_point_yaw = 0.0
+        agv.wait_reason = ""
+        agv.wait_zone = ""
+        agv.yielding_to = ""
+        agv.yield_cooldown_until = 0.0
+        self._release_route_locked(agv.aid)
+        self._clear_conflict_locks_for_agv_locked(agv.aid)
+        return goal_handle
+
+    def _manual_goto(self, agv: AGVState, x: float, y: float, yaw: float):
+        target = (float(x), float(y))
+        move_task = Task(
+            tid=f"MANUAL_{agv.aid}",
+            shelf="",
+            shelf_center_xy=target,
+            pick_xy=target,
+            pick_yaw=float(yaw),
+            aisle_exit_xy=target,
+            drop_xy=target,
+            priority=0,
+            agv=agv.aid,
+            status="manual",
+            kind="manual",
+        )
+        with self.lock:
+            goal_handle = self._force_idle_locked(agv)
+            agv.task = move_task
+            prep = self._prepare_stage_dispatch_locked(
+                agv,
+                move_task,
+                State.RETURNING,
+                wait_on_block=True,
+                use_wait_point=False,
+            )
+        if goal_handle:
+            goal_handle.cancel_goal_async()
+        if prep["action"] == "dispatch":
+            self.get_logger().info(
+                f"[MANUAL] {agv.aid} goto ({target[0]:.1f},{target[1]:.1f})")
+        else:
+            self.get_logger().warn(
+                f"[MANUAL] {agv.aid} waiting for reserved route to "
+                f"({target[0]:.1f},{target[1]:.1f}) via "
+                f"{prep.get('blocker', 'traffic')}")
+        self._execute_prepared_stage(agv, move_task, prep)
+
+    def _manual_stop(self, agv: AGVState):
+        with self.lock:
+            goal_handle = self._force_idle_locked(agv)
+        if goal_handle:
+            goal_handle.cancel_goal_async()
+        self._publish_stop(agv.aid)
+        self.get_logger().warn(f"[MANUAL] {agv.aid} stopped by operator")
 
     def _pair_key(self, left: str, right: str) -> str:
         ordered = sorted([left, right])
@@ -881,7 +1031,8 @@ class AGVScheduler(Node):
             agv: AGVState,
             task: Task,
             stage: State,
-            start_xy: Optional[Tuple[float, float]] = None) -> Tuple[str, Set[str]]:
+            start_xy: Optional[Tuple[float, float]] = None,
+            preempt: bool = False) -> Tuple[str, Set[str]]:
         zones = self._zones_for_stage(agv, task, stage, start_xy)
         blockers: Dict[str, Set[str]] = {}
         for zone in zones:
@@ -891,12 +1042,25 @@ class AGVScheduler(Node):
             if reservation and reservation.agv_id != agv.aid:
                 blockers.setdefault(reservation.agv_id, set()).add(zone)
 
-        if blockers:
+        if blockers and not preempt:
             blocker_id, blocked_zones = max(
                 blockers.items(),
                 key=lambda item: (len(item[1]), item[0]),
             )
             return blocker_id, blocked_zones
+
+        if blockers and preempt:
+            # Highest-priority mover (emergency charge): evict the conflicting
+            # holders so the grant below can take the whole route.
+            for blocker_id, evict_zones in blockers.items():
+                other = self.agvs.get(blocker_id)
+                for zone in evict_zones:
+                    self.route_reservations.pop(zone, None)
+                    if other:
+                        other.reserved_zones.discard(zone)
+                if other and not other.reserved_zones:
+                    other.reserved_stage = ""
+                    other.reservation_deadline = 0.0
 
         self._release_route_locked(agv.aid)
         expires_at = time.time() + self.route_hold_timeout
@@ -969,8 +1133,7 @@ class AGVScheduler(Node):
                 agv.battery = max(0.0, round(agv.battery - drain, 3))
 
                 if (agv.state == State.TO_CHARGE
-                        or (agv.task
-                            and agv.task.tid.startswith("CHARGE_"))):
+                        or (agv.task and agv.task.kind == "charge")):
                     continue
 
                 if agv.battery < self.battery_critical_threshold:
@@ -1006,6 +1169,7 @@ class AGVScheduler(Node):
             priority=0,
             agv=agv.aid,
             status="charging",
+            kind="charge",
         )
         with self.lock:
             if agv.state != State.IDLE or agv.task is not None:
@@ -1043,19 +1207,20 @@ class AGVScheduler(Node):
             priority=0,
             agv=agv.aid,
             status="charging",
+            kind="charge",
         )
         interrupted_tid = None
         goal_handle = None
         prep = None
         with self.lock:
             if (agv.state in (State.TO_CHARGE, State.CHARGING)
-                    or (agv.task
-                        and agv.task.tid.startswith("CHARGE_"))):
+                    or (agv.task and agv.task.kind == "charge")):
                 return
             if agv.task:
                 interrupted_tid = agv.task.tid
                 goal_handle = agv.current_goal_handle
-                if not agv.task.tid.startswith(("CHARGE_", "RETURN_")):
+                # Only real shelf jobs are requeued; internal moves are dropped.
+                if agv.task.kind == "shelf":
                     agv.task.status = "pending"
                     agv.task.agv = ""
                     agv.task.last_error = "battery critical"
@@ -1084,12 +1249,16 @@ class AGVScheduler(Node):
             agv.yield_cooldown_until = 0.0
             self._release_route_locked(agv.aid)
             self._clear_conflict_locks_for_agv_locked(agv.aid)
+            # Emergency charge is highest priority and must not be stranded by
+            # another AGV's reservation: preempt conflicting holds so a
+            # critically low battery never waits in place draining to zero.
             prep = self._prepare_stage_dispatch_locked(
                 agv,
                 charge_task,
                 State.TO_CHARGE,
                 wait_on_block=True,
                 use_wait_point=False,
+                preempt=True,
             )
 
         if goal_handle:
@@ -1123,10 +1292,11 @@ class AGVScheduler(Node):
             task: Task,
             stage: State,
             wait_on_block: bool,
-            use_wait_point: bool = False) -> dict:
+            use_wait_point: bool = True,
+            preempt: bool = False) -> dict:
         goal_xy, goal_yaw, label = self._goal_for_state(task, stage)
         blocker, blocked_zones = self._reserve_stage_locked(
-            agv, task, stage, start_xy=(agv.x, agv.y))
+            agv, task, stage, start_xy=(agv.x, agv.y), preempt=preempt)
         if blocker:
             if wait_on_block:
                 wait_point = self._set_wait_state_locked(
@@ -1265,7 +1435,7 @@ class AGVScheduler(Node):
                 if (agv.state in (State.IDLE, State.RETURNING)
                     or (agv.state == State.WAITING
                         and agv.task
-                        and agv.task.tid.startswith("RETURN_")))
+                        and agv.task.kind == "return"))
                 and agv.battery > self.battery_min_dispatch
             ]
             if not self.queue or not idle:
@@ -1528,6 +1698,7 @@ class AGVScheduler(Node):
                 self._release_route_locked(agv.aid)
                 self._clear_conflict_locks_for_agv_locked(agv.aid)
                 task.status = "done"
+                self._completed_count += 1
                 self.get_logger().info(
                     f"[DONE] {task.tid} completed by {agv.aid}")
                 # Vacate the shared station: head home instead of idling on
@@ -1583,6 +1754,7 @@ class AGVScheduler(Node):
             priority=0,
             agv=agv.aid,
             status="returning",
+            kind="return",
         )
         with self.lock:
             if agv.state != State.IDLE or agv.task is not None:
@@ -1607,11 +1779,14 @@ class AGVScheduler(Node):
         self._execute_prepared_stage(agv, return_task, prep)
 
     def _wait_should_hold_position(self, task: Task, prep: dict) -> bool:
-        # RETURN_ waits are created when the return-home route reservation is
-        # blocked.  In the shipped layout, the configured wait points for the
-        # station lane are the same parking points used as home positions, so
-        # sending a wait-point Nav2 goal would bypass the failed reservation.
-        return bool(prep.get("hold_position") or task.tid.startswith("RETURN_"))
+        # Internal moves (charge / return-home / operator goto) hold in place
+        # when blocked: their goal IS a parking/home point and the configured
+        # wait points coincide with those points, so navigating to a wait point
+        # would bypass the very reservation that failed. Real task stages and
+        # yields instead retreat to a safe wait point to clear the corridor.
+        return bool(
+            prep.get("hold_position")
+            or self._internal_stage_for_task(task) is not None)
 
     def _execute_prepared_stage(self, agv: AGVState, task: Task, prep: dict):
         action = prep.get("action")
@@ -1642,9 +1817,11 @@ class AGVScheduler(Node):
             return
 
     def _internal_stage_for_task(self, task: Task) -> Optional[State]:
-        if task.tid.startswith("CHARGE_"):
+        if task.kind == "charge":
             return State.TO_CHARGE
-        if task.tid.startswith("RETURN_"):
+        # Return-home and operator goto both run as a single RETURNING leg
+        # that parks the AGV at the goal and goes idle on arrival.
+        if task.kind in ("return", "manual"):
             return State.RETURNING
         return None
 
@@ -1769,7 +1946,7 @@ class AGVScheduler(Node):
                 blocker=other,
                 blocked_zone_ids={f"traffic:{zone}" for zone in conflict_zones},
                 hold_until=now + self.yield_hold_duration,
-                use_wait_point=False,
+                use_wait_point=True,
             )
             agv.current_goal_handle = None
             agv.current_goal_xy = None
@@ -1824,6 +2001,10 @@ class AGVScheduler(Node):
                 )
                 if prep["action"] != "dispatch":
                     agv.task.status = f"waiting:{prep['blocker']}"
+                    # Re-arm the backoff so a still-blocked internal retry waits
+                    # the full delay again instead of spinning every tick.
+                    if agv.wait_reason == "internal_retry":
+                        agv.wait_until = now + 5.0
                     continue
 
                 agv.wait_reason = ""
@@ -1932,10 +2113,9 @@ class AGVScheduler(Node):
 
     def _pub_status(self):
         with self.lock:
-            done = sum(1 for task in self.history if task.status == "done")
             payload = {
                 "pending": len(self.queue),
-                "completed": done,
+                "completed": self._completed_count,
                 "queue": [
                     {
                         "tid": task.tid,
