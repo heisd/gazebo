@@ -310,9 +310,13 @@ ros2 topic echo --field data /agv/scheduler_status
 返航任务 `tid = RETURN_<agv_id>`，`priority = 0`：
 
 - 不进入普通任务队列，`_return_task_to_queue` 识别 `RETURN_` 前缀跳过重入队；
+- 和普通阶段一样先通过 `_prepare_stage_dispatch_locked()` /
+  `_reserve_stage_locked()` 申请返航路径，确保 `reserved_zones` 与
+  `route_reservations` 覆盖离开 dock、穿过 `station_lane`、回到 home 的
+  整段路线；
 - 现有路权规则会让低优先级（0）的返航车给真实任务让行，无需改安全逻辑；
-- `RETURNING` 车仍可被调度：若队列有待办任务，`_sched_loop` 会中断返航直接
-  接新任务（取消 home 目标），避免繁忙时浪费返航行程。
+- `RETURNING` 车（以及等待返航预约的 `RETURN_` 内部任务）仍可被调度：若队列有待办任务，
+  `_sched_loop` 会中断返航直接接新任务（取消 home/等待目标），避免繁忙时浪费返航行程。
 
 ## 当前边界
 

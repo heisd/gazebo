@@ -1223,10 +1223,14 @@ class AGVScheduler(Node):
             self._cleanup_route_reservations_locked()
             now = time.time()
             # RETURNING AGVs are still available: a pending task can interrupt
-            # the home trip so a backlog never wastes a return leg.
+            # the home trip (including a reservation wait) so a backlog never
+            # wastes a return leg.
             idle = [
                 agv for agv in self.agvs.values()
-                if agv.state in (State.IDLE, State.RETURNING)
+                if (agv.state in (State.IDLE, State.RETURNING)
+                    or (agv.state == State.WAITING
+                        and agv.task
+                        and agv.task.tid.startswith("RETURN_")))
                 and agv.battery > self.battery_min_dispatch
             ]
             if not self.queue or not idle:
@@ -1546,18 +1550,23 @@ class AGVScheduler(Node):
         with self.lock:
             if agv.state != State.IDLE or agv.task is not None:
                 return
-            agv.state = State.RETURNING
             agv.task = return_task
-        if not self._send_nav(home.xy, home.yaw, return_task, agv):
-            with self.lock:
-                if agv.state == State.RETURNING:
-                    agv.state = State.IDLE
-                    agv.task = None
-            self._publish_stop(agv.aid)
-            return
-        self.get_logger().info(
-            f"[RETURN] {agv.aid} delivered, returning home to "
-            f"({home.xy[0]:.1f},{home.xy[1]:.1f})")
+            prep = self._prepare_stage_dispatch_locked(
+                agv,
+                return_task,
+                State.RETURNING,
+                wait_on_block=True,
+            )
+
+        if prep["action"] == "dispatch":
+            self.get_logger().info(
+                f"[RETURN] {agv.aid} delivered, returning home to "
+                f"({home.xy[0]:.1f},{home.xy[1]:.1f})")
+        else:
+            self.get_logger().warn(
+                f"[RETURN] {agv.aid} waiting for reserved route home via "
+                f"{prep.get('blocker', 'traffic')}")
+        self._execute_prepared_stage(agv, return_task, prep)
 
     def _execute_prepared_stage(self, agv: AGVState, task: Task, prep: dict):
         action = prep.get("action")
