@@ -313,7 +313,8 @@ ros2 topic echo --field data /agv/scheduler_status
 - 和普通阶段一样先通过 `_prepare_stage_dispatch_locked()` /
   `_reserve_stage_locked()` 申请返航路径，确保 `reserved_zones` 与
   `route_reservations` 覆盖离开 dock、穿过 `station_lane`、回到 home 的
-  整段路线；
+  整段路线；若返航路径被预约阻塞，AGV 原地等待并重试，不会把 home/parking
+  wait point 当成未预约的等待导航目标；
 - 现有路权规则会让低优先级（0）的返航车给真实任务让行，无需改安全逻辑；
 - `RETURNING` 车（以及等待返航预约的 `RETURN_` 内部任务）仍可被调度：若队列有待办任务，
   `_sched_loop` 会中断返航直接接新任务（取消 home/等待目标），避免繁忙时浪费返航行程。

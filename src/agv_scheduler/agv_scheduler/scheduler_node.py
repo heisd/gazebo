@@ -1093,7 +1093,8 @@ class AGVScheduler(Node):
             agv: AGVState,
             task: Task,
             stage: State,
-            wait_on_block: bool) -> dict:
+            wait_on_block: bool,
+            use_wait_point: bool = True) -> dict:
         goal_xy, goal_yaw, label = self._goal_for_state(task, stage)
         blocker, blocked_zones = self._reserve_stage_locked(
             agv, task, stage, start_xy=(agv.x, agv.y))
@@ -1109,6 +1110,7 @@ class AGVScheduler(Node):
                     blocker=blocker,
                     blocked_zone_ids=blocked_zones,
                     hold_until=0.0,
+                    use_wait_point=use_wait_point,
                 )
                 return {
                     "action": "wait",
@@ -1117,6 +1119,7 @@ class AGVScheduler(Node):
                     "label": label,
                     "blocker": blocker,
                     "wait_point": wait_point,
+                    "hold_position": not use_wait_point,
                 }
             return {
                 "action": "blocked",
@@ -1149,15 +1152,18 @@ class AGVScheduler(Node):
             reason: str,
             blocker: str,
             blocked_zone_ids: Set[str],
-            hold_until: float) -> Optional[WaitPoint]:
-        wait_point = self._select_wait_point(
-            agv,
-            {
-                zone.split(":", 1)[1]
-                for zone in blocked_zone_ids
-                if zone.startswith("traffic:")
-            },
-        )
+            hold_until: float,
+            use_wait_point: bool = True) -> Optional[WaitPoint]:
+        wait_point = None
+        if use_wait_point:
+            wait_point = self._select_wait_point(
+                agv,
+                {
+                    zone.split(":", 1)[1]
+                    for zone in blocked_zone_ids
+                    if zone.startswith("traffic:")
+                },
+            )
         agv.state = State.WAITING
         agv.resume_state = resume_state
         agv.resume_goal_xy = resume_goal_xy
@@ -1556,6 +1562,7 @@ class AGVScheduler(Node):
                 return_task,
                 State.RETURNING,
                 wait_on_block=True,
+                use_wait_point=False,
             )
 
         if prep["action"] == "dispatch":
@@ -1580,6 +1587,12 @@ class AGVScheduler(Node):
 
         if action == "wait":
             blocker = prep.get("blocker", "traffic")
+            if prep.get("hold_position"):
+                self._publish_stop(agv.aid)
+                self.get_logger().warn(
+                    f"[WAIT] {agv.aid} holds position for "
+                    f"stage:{prep.get('label', 'next')} ({blocker})")
+                return
             wait_point = prep.get("wait_point")
             self._send_wait_nav_or_stop(
                 agv,
