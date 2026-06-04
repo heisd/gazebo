@@ -13,6 +13,7 @@
 | `setup.py` | 注册 `scheduler_node` 命令 |
 | `test/` | Python lint/版权/docstring 测试模板 |
 | `docs/scheduler_data_flow.md` | 调度器代码分析与 Mermaid 数据流图 |
+| `docs/right_of_way.md` | 路权 / 让行逻辑设计说明（两层防撞、让行判定、防活锁） |
 
 ## 当前调度思路
 
@@ -128,17 +129,20 @@ base_frames:
 
 ## 让行和等待点
 
-当前让行逻辑分两层：
+当前让行逻辑分两层（完整设计见 [`docs/right_of_way.md`](docs/right_of_way.md)）：
 
-1. 主逻辑：区域预约
+1. 主逻辑：区域预约（事前）
    - 任务分配前或阶段切换前，如果目标阶段资源被占用，车辆进入 `WAITING`
-   - reservation wait 默认原地停止并重试；避免把等待点路径变成未预约的
-     隐式导航
-2. 最后安全层：近距离让行
-   - 当两车距离小于 `safety_stop_distance` 时，仍会触发强制让行
-   - 但 winner / loser 会在一次冲突周期内锁定，避免来回震荡
+   - **内部移动**（charge/return/manual）的 reservation wait **原地停止并重试**，
+     因为它们的等待点就是目标点，导航过去会绕过失败的预约
+   - **真实任务阶段**的阻塞则**退避到安全等待点**腾出车道
+2. 最后安全层：近距离让行（事后）
+   - 当两车距离小于 `safety_stop_distance`（默认 1.0m）时触发强制让行
+   - 让行车（真实任务）**退避到安全等待点**，分离超过
+     `right_of_way_release_distance`（默认 1.6m）后才恢复（迟滞防抖）
+   - winner / loser 会用 `ConflictLock` 锁定，避免来回震荡
 
-路权选择规则（优先级从高到低）：
+路权选择规则（优先级从高到低，`_right_of_way_victim`）：
 
 1. **低电量/充电优先（最高）**：一方处于 `TO_CHARGE` 或电量 < `battery_low_threshold` 时，另一方让行。
 2. 一方有任务、一方无任务 → 有任务的让行。
@@ -146,8 +150,8 @@ base_frames:
 4. 两方都有任务 → 低优先级让行。
 5. 优先级相同 → agv_id 较大的让行（通常 `agv_02`）。
 
-恢复任务前会重新为当前阶段申请资源。当前默认不再为 reservation/yield
-等待发送未预约的 wait-point 导航目标，而是原地保持并等待预约重试。
+恢复任务前会重新为当前阶段申请资源。防活锁靠四件事兜底：冲突锁记忆、让行冷却
+（`yield_cooldown_*`）、触发/恢复距离迟滞、最短保持时间——详见路权设计文档。
 
 ## 预约保活
 
