@@ -35,3 +35,4 @@ agv_scheduler:
     battery_low_threshold: 20.0
     battery_critical_threshold: 10.0
     battery_full_threshold: 95.0
+    battery_min_dispatch: 15.0

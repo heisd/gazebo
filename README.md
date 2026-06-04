@@ -92,6 +92,8 @@ ros2 run tf2_ros tf2_echo map agv_02_base_footprint
    - `station_queue`
 4. 让行时优先驶向固定等待点，不再默认原地堵在路中央
 5. reservation 周期续约，任务完成或异常时主动释放
+6. 任务分配按周期批量派发所有空闲车，并用距离 + 电量成本择优，
+   不再每秒只派一台车
 
 这意味着系统已经不只是“快撞了才停车”，而是开始在进入冲突区域前做排队和路权控制。
 
@@ -245,6 +247,7 @@ battery_charge_rate: 1.0       # %/秒，充电中回复速率
 battery_low_threshold: 20.0    # 空闲时触发充电的阈值
 battery_critical_threshold: 10.0  # 紧急充电阈值，中断正在执行的任务
 battery_full_threshold: 95.0   # 充电达到此值后返回 idle
+battery_min_dispatch: 15.0     # 低于此电量不再派发新任务（_sched_loop 把关）
 ```
 
 充电站坐标由 `warehouse_layout.yaml` 中的 `charging.center` 定义，当前为 `(9.0, -8.0)`。
@@ -255,7 +258,7 @@ battery_full_threshold: 95.0   # 充电达到此值后返回 idle
 |---|---|
 | 电量 < `battery_critical_threshold`（10%） | 立刻中断当前任务，任务返回队列，直接导航充电站 |
 | 电量 < `battery_low_threshold`（20%）且空闲 | 正常调度结束后导航充电站 |
-| 电量 < 15% | 不接受新任务（`_sched_loop` 把关） |
+| 电量 < `battery_min_dispatch`（默认 15%） | 不接受新任务（`_sched_loop` 把关） |
 
 充电状态流：`任意状态` → `TO_CHARGE` → `CHARGING` → `IDLE`
 

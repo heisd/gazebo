@@ -25,7 +25,7 @@ agv_scheduler
   - 按 priority 排队
   - 从 TF 优先读取 map -> base_footprint 位置
   - TF 不可用时回退到 odom
-  - 按空闲车距离分配任务
+  - 每个调度周期为所有空闲车批量分配任务（按距离 + 电量成本择优）
   - 按阶段预约交通资源
   - 冲突时把低优先级车送到固定等待点
   - 向对应 Nav2 action 发送目标
@@ -43,6 +43,8 @@ agv_scheduler
 2. 预约从“整条任务一次锁死”改成“`TO_SHELF` / `TO_AISLE_EXIT` / `TO_STATION` 分阶段锁定”。
 3. `dock:station` 只在进入 `TO_STATION` 前预约，不再一接单就抢占出货位。
 4. 让行时优先去配置好的固定等待点，而不是在当前位置原地堵住通道。
+5. 任务分配从“每周期只派一台车”改成“每周期批量派完所有空闲车”，并用
+   距离 + 电量成本函数 (`_assignment_cost`) 择优，吞吐随车队规模线性提升。
 
 ## 仓库布局配置
 
@@ -206,7 +208,12 @@ battery_charge_rate: 1.0         # %/秒
 battery_low_threshold: 20.0      # 空闲时触发充电 (%)
 battery_critical_threshold: 10.0 # 紧急中断任务充电 (%)
 battery_full_threshold: 95.0     # 停止充电 (%)
+battery_min_dispatch: 15.0       # 低于此电量不再派发新任务 (%)
 ```
+
+`battery_min_dispatch` 替换了旧代码里写死的魔法数字 `15`，现在可在
+`two_agv_scheduler.yaml` 里配置；`_sched_loop` 只会把电量高于该阈值的空闲车
+纳入候选。
 
 充电任务（tid = `CHARGE_<agv_id>`）不进入普通任务队列；`_return_task_to_queue` 识别 `CHARGE_` 前缀并跳过重入队。
 

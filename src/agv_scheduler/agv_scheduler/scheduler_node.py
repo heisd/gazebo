@@ -229,6 +229,8 @@ class AGVScheduler(Node):
             self.get_parameter("battery_critical_threshold").value)
         self.battery_full_threshold = float(
             self.get_parameter("battery_full_threshold").value)
+        self.battery_min_dispatch = float(
+            self.get_parameter("battery_min_dispatch").value)
         self.path_sample_step = max(0.25, self.route_cell_size / 2.0)
 
         agv_ids = self._string_list_param("agv_ids", ["agv_01"])
@@ -345,6 +347,7 @@ class AGVScheduler(Node):
         self.declare_parameter("battery_low_threshold", 20.0)
         self.declare_parameter("battery_critical_threshold", 10.0)
         self.declare_parameter("battery_full_threshold", 95.0)
+        self.declare_parameter("battery_min_dispatch", 15.0)
         self.declare_parameter("shelf_layout_file", "")
 
     def _load_warehouse_layout(
@@ -1198,27 +1201,49 @@ class AGVScheduler(Node):
             f"[WAIT] {agv.aid} -> {wait_point.name} for {reason} "
             f"({blocker})")
 
+    def _assignment_cost(self, agv: AGVState, task: Task) -> float:
+        """Rank candidate AGVs for a task (lower is better).
+
+        Nearest AGV to the pickup wins; a battery below the low threshold
+        adds a penalty so a nearly empty AGV is not sent on a long run while
+        a fuller one is idle.
+        """
+        dist = math.hypot(
+            agv.x - task.pick_xy[0], agv.y - task.pick_xy[1])
+        battery_penalty = max(
+            0.0, self.battery_low_threshold - agv.battery) * 0.1
+        return dist + battery_penalty
+
     def _sched_loop(self):
-        assignment = None
+        assignments = []
         with self.lock:
             self._cleanup_route_reservations_locked()
+            now = time.time()
             idle = [
                 agv for agv in self.agvs.values()
-                if agv.state == State.IDLE and agv.battery > 15
+                if agv.state == State.IDLE
+                and agv.battery > self.battery_min_dispatch
             ]
             if not self.queue or not idle:
                 return
 
-            for task_idx, task in enumerate(list(self.queue)):
-                if task.retry_after > time.time():
+            assigned_agvs: Set[str] = set()
+            assigned_tids: Set[str] = set()
+            for task in list(self.queue):
+                if len(assigned_agvs) >= len(idle):
+                    break
+                if task.retry_after > now:
                     continue
                 candidates = [
                     agv for agv in idle
-                    if not task.requested_agv or agv.aid == task.requested_agv
+                    if agv.aid not in assigned_agvs
+                    and (not task.requested_agv
+                         or agv.aid == task.requested_agv)
                 ]
+                if not candidates:
+                    continue
                 candidates.sort(
-                    key=lambda agv: math.hypot(agv.x - task.pick_xy[0],
-                                               agv.y - task.pick_xy[1]))
+                    key=lambda agv: self._assignment_cost(agv, task))
                 for agv in candidates:
                     prep = self._prepare_stage_dispatch_locked(
                         agv,
@@ -1230,32 +1255,38 @@ class AGVScheduler(Node):
                         task.status = f"waiting:{prep['blocker']}"
                         continue
 
-                    self.queue.pop(task_idx)
                     task.agv = agv.aid
                     task.status = "running"
                     agv.task = task
-                    assignment = (agv.aid, task, prep)
-                    break
-                if assignment:
+                    assigned_agvs.add(agv.aid)
+                    assigned_tids.add(task.tid)
+                    assignments.append((agv.aid, task, prep))
                     break
 
-        if not assignment:
-            return
+            if assigned_tids:
+                self.queue = [
+                    task for task in self.queue
+                    if task.tid not in assigned_tids
+                ]
 
-        aid, task, prep = assignment
-        agv = self.agvs[aid]
-        self.get_logger().info(
-            f"[ASSIGN] {task.tid} -> {aid} shelf={task.shelf} "
-            f"center=({task.shelf_center_xy[0]:.1f},{task.shelf_center_xy[1]:.1f}) "
-            f"pickup=({task.pick_xy[0]:.1f},{task.pick_xy[1]:.1f},"
-            f"yaw={task.pick_yaw:.2f})")
-        self._pub_assign(agv, task)
-        if not self._send_nav(prep["goal_xy"], prep["goal_yaw"], task, agv):
-            self._return_task_to_queue(agv, task, "Nav2 server not ready")
-            return
-        with self.lock:
-            if not any(existing.tid == task.tid for existing in self.history):
-                self.history.append(task)
+        for aid, task, prep in assignments:
+            agv = self.agvs[aid]
+            self.get_logger().info(
+                f"[ASSIGN] {task.tid} -> {aid} shelf={task.shelf} "
+                f"center=({task.shelf_center_xy[0]:.1f},"
+                f"{task.shelf_center_xy[1]:.1f}) "
+                f"pickup=({task.pick_xy[0]:.1f},{task.pick_xy[1]:.1f},"
+                f"yaw={task.pick_yaw:.2f})")
+            self._pub_assign(agv, task)
+            if not self._send_nav(
+                    prep["goal_xy"], prep["goal_yaw"], task, agv):
+                self._return_task_to_queue(agv, task, "Nav2 server not ready")
+                continue
+            with self.lock:
+                if not any(
+                        existing.tid == task.tid
+                        for existing in self.history):
+                    self.history.append(task)
 
     def _send_nav(
             self,
