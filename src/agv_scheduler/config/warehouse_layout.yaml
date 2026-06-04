@@ -80,8 +80,12 @@ warehouse_layout:
       wait_points:
         agv_01: [10.8, 4.0, 3.1416]
         agv_02: [10.8, -4.0, 3.1416]
+    # queue (not exclusive): every task must cross this lane to reach the
+    # shelves, so a full-lane exclusive lock would serialize the whole fleet.
+    # Fine-grained cell reservations + dock:station still prevent collisions
+    # inside the lane while allowing two AGVs to use it at different points.
     station_lane:
-      type: exclusive
+      type: queue
       polygon:
         - [4.8, -6.0]
         - [6.8, -6.0]

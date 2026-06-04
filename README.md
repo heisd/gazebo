@@ -92,6 +92,8 @@ ros2 run tf2_ros tf2_echo map agv_02_base_footprint
    - `station_queue`
 4. 让行时优先驶向固定等待点，不再默认原地堵在路中央
 5. reservation 周期续约，任务完成或异常时主动释放
+6. 任务分配按周期批量派发所有空闲车，并用距离 + 电量成本择优，
+   不再每秒只派一台车
 
 这意味着系统已经不只是“快撞了才停车”，而是开始在进入冲突区域前做排队和路权控制。
 
@@ -189,6 +191,11 @@ yield_cooldown_duration: 3.0
 
 让行中的车辆会在 `/agv/scheduler_status` 里显示 `state: "waiting"`、`yielding_to`、`wait_reason`、`wait_point` 和 `resume_goal`。
 
+**送货后返航（避免霸占共享 dock）：** 任务送达出货站后，车辆不会空闲滞留在
+dock 上，而是进入 `RETURNING` 返回各自 home 停车位（`wait_points.parking_<agv_id>`）
+再转 `IDLE`。否则空闲车堵在共享 dock 上会让另一台带任务的车反复让行直至死锁。
+返航任务优先级为 0，会给真实任务让路；若队列有待办，调度器会中断返航直接接新单。
+
 ## 交通区与等待点
 
 调度器会从 `src/agv_scheduler/config/warehouse_layout.yaml` 读取交通区：
@@ -198,7 +205,7 @@ traffic_zones:
   main_corridor:
     type: exclusive
   station_lane:
-    type: exclusive
+    type: queue
   station_queue:
     type: queue
 ```
@@ -206,7 +213,11 @@ traffic_zones:
 含义：
 
 - `exclusive`: 同一时刻只允许一台车占用
-- `queue`: 主要用于排队可视化和等待点选择，不做强互斥
+- `queue`: 主要用于排队可视化和等待点选择，不做强互斥；车道内防撞依赖更细粒度的 `cell` 预约
+
+> `station_lane` 之所以是 `queue` 而不是 `exclusive`：每个任务都必须穿过这条
+> 纵向车道，如果整条独占，两台车永远无法并行（实测会把双车 makespan 从 54s
+> 拖到 85s）。改 `queue` 后由 `cell` 预约保证不撞，同时放开并行。
 
 每个关键区都可以配置 `wait_points.agv_01`、`wait_points.agv_02`。当某台车因为阶段预约失败或近距离让行需要退出冲突区时，调度器会优先把它送到这些固定安全点。
 
@@ -245,6 +256,7 @@ battery_charge_rate: 1.0       # %/秒，充电中回复速率
 battery_low_threshold: 20.0    # 空闲时触发充电的阈值
 battery_critical_threshold: 10.0  # 紧急充电阈值，中断正在执行的任务
 battery_full_threshold: 95.0   # 充电达到此值后返回 idle
+battery_min_dispatch: 15.0     # 低于此电量不再派发新任务（_sched_loop 把关）
 ```
 
 充电站坐标由 `warehouse_layout.yaml` 中的 `charging.center` 定义，当前为 `(9.0, -8.0)`。
@@ -255,7 +267,7 @@ battery_full_threshold: 95.0   # 充电达到此值后返回 idle
 |---|---|
 | 电量 < `battery_critical_threshold`（10%） | 立刻中断当前任务，任务返回队列，直接导航充电站 |
 | 电量 < `battery_low_threshold`（20%）且空闲 | 正常调度结束后导航充电站 |
-| 电量 < 15% | 不接受新任务（`_sched_loop` 把关） |
+| 电量 < `battery_min_dispatch`（默认 15%） | 不接受新任务（`_sched_loop` 把关） |
 
 充电状态流：`任意状态` → `TO_CHARGE` → `CHARGING` → `IDLE`
 

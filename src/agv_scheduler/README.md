@@ -25,7 +25,7 @@ agv_scheduler
   - 按 priority 排队
   - 从 TF 优先读取 map -> base_footprint 位置
   - TF 不可用时回退到 odom
-  - 按空闲车距离分配任务
+  - 每个调度周期为所有空闲车批量分配任务（按距离 + 电量成本择优）
   - 按阶段预约交通资源
   - 冲突时把低优先级车送到固定等待点
   - 向对应 Nav2 action 发送目标
@@ -37,12 +37,21 @@ agv_scheduler
 /agv_XX/navigate_to_pose
 ```
 
-和旧版相比，核心变化有四个：
+和旧版相比，核心变化有七个：
 
 1. 共享交通判断优先使用 `map` 坐标，不再默认直接拿 `/odom` 当全局真值。
 2. 预约从“整条任务一次锁死”改成“`TO_SHELF` / `TO_AISLE_EXIT` / `TO_STATION` 分阶段锁定”。
 3. `dock:station` 只在进入 `TO_STATION` 前预约，不再一接单就抢占出货位。
 4. 让行时优先去配置好的固定等待点，而不是在当前位置原地堵住通道。
+5. 任务分配从“每周期只派一台车”改成“每周期批量派完所有空闲车”，并用
+   距离 + 电量成本函数 (`_assignment_cost`) 择优，吞吐随车队规模线性提升。
+6. `station_lane` 由 `exclusive` 改为 `queue`：每个任务都要穿过这条车道，
+   整条独占会把车队串行化；改 `queue` 后由 `cell` 预约防撞，放开并行。
+7. 送货完成后返航 home 停车位（`RETURNING`），不再空闲霸占共享出货 dock，
+   消除"空闲车堵死 dock"导致的死锁。
+
+> 这些改动均用离线闭环台架 `tools/closed_loop_sim.py` 验证过：双车 4 任务
+> 场景下并行度从 1 升到 2、makespan 从 85s 降到 54s、让行震荡从 47 次降到 0。
 
 ## 仓库布局配置
 
@@ -76,7 +85,7 @@ traffic_zones:
 | 字段 | 含义 |
 | --- | --- |
 | `type: exclusive` | 同一时刻只允许一台车占用该交通区 |
-| `type: queue` | 只用于状态可视化和等待点选择，不作为强互斥锁 |
+| `type: queue` | 只用于状态可视化和等待点选择，不作为强互斥锁；车道内防撞依赖更细粒度的 `cell` 预约 |
 | `polygon` | 交通区多边形，调度器会把当前阶段路线采样点投进去命中区域 |
 | `wait_points` | 固定安全等待点，按 `agv_id` 绑定 |
 | `wait_points` 顶层节点 | 没命中专属交通区时的兜底等待点 |
@@ -206,7 +215,12 @@ battery_charge_rate: 1.0         # %/秒
 battery_low_threshold: 20.0      # 空闲时触发充电 (%)
 battery_critical_threshold: 10.0 # 紧急中断任务充电 (%)
 battery_full_threshold: 95.0     # 停止充电 (%)
+battery_min_dispatch: 15.0       # 低于此电量不再派发新任务 (%)
 ```
+
+`battery_min_dispatch` 替换了旧代码里写死的魔法数字 `15`，现在可在
+`two_agv_scheduler.yaml` 里配置；`_sched_loop` 只会把电量高于该阈值的空闲车
+纳入候选。
 
 充电任务（tid = `CHARGE_<agv_id>`）不进入普通任务队列；`_return_task_to_queue` 识别 `CHARGE_` 前缀并跳过重入队。
 
@@ -276,10 +290,29 @@ ros2 topic echo --field data /agv/scheduler_status
 | `TO_STATION` | 前往出货站 |
 | `TO_CHARGE` | 前往充电区 |
 | `CHARGING` | 充电中 |
+| `RETURNING` | 送货完成后返回各自 home 停车位（不滞留在共享出货站）|
 | `WAITING` | 资源冲突或安全让行中，必要时前往固定等待点 |
 | `ERROR` | 异常 |
 
 代码中还定义了 `DELIVERING`，当前流程没有显式停留在这个状态。
+
+### 送货后返航（避免霸占共享 dock）
+
+`TO_STATION` 完成后，AGV **不会**在出货站 dock 处空闲滞留，而是进入
+`RETURNING`，导航回自己的 home 停车位（`warehouse_layout.yaml` 里的
+`wait_points.parking_<agv_id>`）再转 `IDLE`。
+
+原因：出货 dock 是所有任务的共享终点。如果一台车送完货空闲停在 dock 上，
+另一台带任务的车永远到不了 dock，而"有任务车给无任务车让行"的路权规则会让
+带任务车反复退避——形成**死锁/让行震荡**。返航后 home 停车位彼此独立且不在
+任何交通区内，从根本上消除了这种争用。
+
+返航任务 `tid = RETURN_<agv_id>`，`priority = 0`：
+
+- 不进入普通任务队列，`_return_task_to_queue` 识别 `RETURN_` 前缀跳过重入队；
+- 现有路权规则会让低优先级（0）的返航车给真实任务让行，无需改安全逻辑；
+- `RETURNING` 车仍可被调度：若队列有待办任务，`_sched_loop` 会中断返航直接
+  接新任务（取消 home 目标），避免繁忙时浪费返航行程。
 
 ## 当前边界
 
