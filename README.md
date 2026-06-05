@@ -1,6 +1,6 @@
 # AGV 仓储两车仿真工作区
 
-这个仓库是一个 ROS 2 Humble 仓储 AGV 仿真工作区，包含机器人模型、Gazebo 仓库世界、Nav2 导航配置和中央调度器。当前重点是让两台 AGV 在共享仓库里独立导航，并按交通规则并行执行货架任务。
+这个仓库是一个 ROS 2 Humble 仓储 AGV 仿真工作区，包含机器人模型、Gazebo 仓库世界、Nav2 导航配置和中央调度器。当前重点是让两台 AGV 在共享仓库里独立导航，并按交通规则并行执行货架任务。除任务调度外，还提供面向操作员的指令通道与 Web 控制面板，以及一套无需 ROS/Gazebo 的离线闭环验证台架（见 `tools/`）。
 
 ## 包结构
 
@@ -12,8 +12,10 @@
 | `src/agv_scheduler` | 任务队列、阶段式交通预约、等待点让行和任务恢复 |
 | `src/agv_bringup` | 单车/两车仿真启动入口 |
 | `src/agv_corridor_layer` | 走廊占用 costmap layer 试验包，当前未并入主流程 |
+| `tools/` | 无 ROS 依赖的离线闭环仿真台架、Web 控制面板与验证脚本（见 `tools/README.md`） |
 
-更细的包级说明在各包自己的 `README.md` 里。
+更细的包级说明在各包自己的 `README.md` 里。调度器的路权/让行设计单独成文：
+[`src/agv_scheduler/docs/right_of_way.md`](src/agv_scheduler/docs/right_of_way.md)。
 
 ## 构建
 
@@ -99,8 +101,9 @@ ros2 run tf2_ros tf2_echo map agv_02_base_footprint
 
 ## 发布并行任务
 
-向 `/agv/task_request` 发布任务。每个任务的 `tid` 必须唯一，否则状态里会出现
-两台车都显示同一个任务号，调试时很难判断是哪一单。
+向 `/agv/task_request` 发布任务。建议每个任务的 `tid` 唯一：调度器会拒收与队列中/
+执行中/近期历史里重复的 `tid`（日志 `Duplicate task id ignored`），也会拒收以
+内部保留前缀 `CHARGE_` / `RETURN_` / `MANUAL_` 开头的 `tid`（这些是调度器内部移动专用）。
 
 ```bash
 ros2 topic pub --once /agv/task_request std_msgs/msg/String \
@@ -145,6 +148,70 @@ ros2 topic echo --field data /agv/scheduler_status
 
 并且 `state` 会类似 `to_shelf`、`picking`、`to_aisle_exit` 或 `to_station`。
 
+## 操作员控制通道（`/agv/agv_command`）
+
+除了 `/agv/task_request` 的货架任务，调度器还订阅一个面向操作员的指令通道
+`/agv/agv_command`，可直接控制单台车。负载是 JSON 对象 `{"cmd": ..., "agv_id": ...}`：
+
+| `cmd` | 作用 | 必填字段 |
+| --- | --- | --- |
+| `task` | 入队一个货架任务（等价于发 `/agv/task_request`） | `shelf`（`priority`/`agv_id` 可选） |
+| `goto` | 让指定车直接驶向 `x, y[, yaw]` 并就地泊车 | `agv_id`, `x`, `y` |
+| `charge` | 立刻送指定车去充电桩 | `agv_id` |
+| `return` | 送指定车返回 home 停车位 | `agv_id` |
+| `stop` | 取消当前目标并停住 | `agv_id` |
+
+`goto/charge/return/stop` 会先把目标车 `force-idle`（取消在途目标、清预约），所以
+任务执行中途也能立即响应；它们仍复用分阶段预约路径，交通控制照常生效。手动 `goto`
+作为操作员意图是**权威的**，不会被自动调度器中途改派。
+
+```bash
+# 让 agv_01 直接开到 (-5, 1)
+ros2 topic pub --once /agv/agv_command std_msgs/msg/String \
+  "{data: '{\"cmd\":\"goto\",\"agv_id\":\"agv_01\",\"x\":-5.0,\"y\":1.0}'}"
+# 让 agv_02 立刻停住
+ros2 topic pub --once /agv/agv_command std_msgs/msg/String \
+  "{data: '{\"cmd\":\"stop\",\"agv_id\":\"agv_02\"}'}"
+```
+
+## Web 控制面板（`tools/control_panel.py`）
+
+一个零依赖、零构建的 Web 控制台，通过上面的 `/agv/agv_command` 驱动两车，并订阅
+`/agv/scheduler_status` 实时回显。两种后端：
+
+```bash
+python3 tools/control_panel.py            # SIM：本机直接可玩，无需 ROS/Gazebo
+python3 tools/control_panel.py --ros      # 在机器人主机上桥接正在运行的调度器
+```
+
+默认仅绑本机 `127.0.0.1`（接口无鉴权）；要让局域网访问才显式传
+`--host 0.0.0.0`，且只在可信网络里用。打开浏览器访问 `http://<host>:<port>`
+（默认 `--port 8080`，SIM 倍速 `--rate`）。
+
+面板能力：
+
+- **仓库地图**：货架、出货 dock、充电桩、交通区与让行等待点，两车实时位姿、目标连线、
+  电量/状态标签；**点击地图即可让选中的车开过去**。
+- **手动控制**（每车）：`Goto`、`⚡ 充电`、`⌂ 返航`、`■ 停车`；车队表会高亮让行
+  （`⤳ <对方>`）/ 等待（`⏸ <原因>`）状态。
+- **派发任务** 与实时队列、完成数、活动日志（ROS 模式日志取自 `/rosout`）。
+- **冲突测试**：一键制造两车路径冲突，验证冲突能否被化解（`cross` 走廊串行、`headon`
+  迎面、`strong` 非独占车道贴近触发实时让行、`reset` 复位）。
+
+## 离线闭环验证（无需 ROS/Gazebo）
+
+`tools/` 下有一套把 ROS plumbing 用桩替换、**导入未修改的真实 `scheduler_node.py`**
+的确定性闭环台架，可在没有 ROS/Gazebo 的环境里回归调度逻辑：
+
+```bash
+python3 tools/closed_loop_sim.py    # 双车 4 任务对照实验（串行化基线 vs 当前并行）
+python3 tools/verify_panel.py       # 面板控制 + 各项修复 + 冲突解决的断言式验证
+```
+
+`verify_panel.py` 覆盖：手动 `goto/stop/return/charge`、4 任务闭环、内部/外部任务区分、
+有界历史与单调完成计数、紧急充电抢占预约、让行退避等待点、以及 `cross/headon/strong`
+三个冲突场景（断言两车从不同时占用独占走廊、强冲突下实时让行触发、且都到达目标）。
+
 ## 货架侧停靠等待
 
 当前调度器发送的是 Nav2 `NavigateToPose` action，不是 `FollowWaypoints`。
@@ -166,6 +233,9 @@ src/agv_scheduler/config/two_agv_scheduler.yaml
 车辆到达货架 `pickup` 点后进入 `PICKING`，等待该时长，再申请下一阶段资源并前往 `aisle_exit`。
 
 ## 两车并行与避碰
+
+> 路权/让行的完整设计（两层防撞模型、让行判定阶梯、退避等待点、防活锁机制、参数与
+> 实测时间线）见 [`src/agv_scheduler/docs/right_of_way.md`](src/agv_scheduler/docs/right_of_way.md)。
 
 两车的 Nav2 action、速度话题、里程计和 TF 都按 namespace 隔离，所以系统支持两台车同时运动。调度器会按空闲车辆和任务路线进行分配，并通过两层机制降低冲突：
 
