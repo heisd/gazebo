@@ -11,6 +11,10 @@
 >
 > 注意：正文里出现的"修复 #2 / #3"指的是更早一轮的**评审 Bug 编号**（退避到等待点、
 > 等待点导航可达），与上面这组改动是两套独立编号，勿混淆。
+>
+> 📐 完整的"路径冲突 → 让行 → 恢复"端到端流程图见可编辑的 draw.io / mxGraph XML：
+> [`right_of_way_yield_flow.drawio`](right_of_way_yield_flow.drawio)（用
+> [app.diagrams.net](https://app.diagrams.net) 或 VS Code 的 Draw.io 插件打开）。
 
 ---
 
