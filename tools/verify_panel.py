@@ -563,6 +563,46 @@ def test_fix4_battery_single_source():
           a1.battery < 60.0, f"battery={a1.battery}")
 
 
+def test_fix5_fair_yield_tiebreak():
+    """fix #5: equal-priority right-of-way ties no longer always pick the same
+    (lexicographically larger) AGV. The one that has yielded fewer times yields
+    next, so over repeated conflicts the two alternate instead of one AGV
+    always losing."""
+    b = fresh()
+    Task = b.mod.Task
+    s = b.sched
+    a1, a2 = s.agvs["agv_01"], s.agvs["agv_02"]
+
+    def mk():
+        return Task(tid="x", shelf="A1", shelf_center_xy=(0, 0), pick_xy=(0, 0),
+                    pick_yaw=0.0, aisle_exit_xy=(0, 0), drop_xy=(0, 0),
+                    priority=1)
+
+    a1.task = mk()
+    a2.task = mk()
+    victims = []
+    for _ in range(6):
+        v = s._lower_priority_agv(a1, a2)        # equal priority -> tie-break
+        victims.append(v.aid)
+        v.yield_count += 1                        # the yield that would follow
+    alternates = (len(set(victims)) == 2
+                  and victims[0] != victims[1]
+                  and victims.count("agv_01") == victims.count("agv_02"))
+    check("fix#5 equal-priority yield tie-break alternates (no fixed loser)",
+          alternates, f"victims={victims}")
+
+    # higher priority still wins regardless of yield history (lower number =
+    # higher priority loser; priority field: larger = more important)
+    a1.task = mk()
+    a2.task = mk()
+    a1.task.priority = 1
+    a2.task.priority = 9
+    a1.yield_count = 100      # even with a huge yield debt, priority dominates
+    v = s._lower_priority_agv(a1, a2)
+    check("fix#5 priority still dominates the fair tie-break",
+          v.aid == "agv_01", f"victim={v.aid}")
+
+
 def _corridor_poly(sched):
     z = sched.traffic_zones.get("main_corridor")
     return z.polygon if z else None
@@ -665,6 +705,7 @@ def main():
     test_fix1_wait_release_tolerance()
     test_fix3_stall_releases_reservation()
     test_fix4_battery_single_source()
+    test_fix5_fair_yield_tiebreak()
     print("\n-- Conflict resolution (deliberate path conflicts) --")
     test_conflict_cross_tasks()
     test_conflict_headon_goto()

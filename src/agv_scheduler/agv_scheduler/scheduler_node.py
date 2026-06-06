@@ -139,6 +139,9 @@ class AGVState:
     wait_zone: str = ""
     yielding_to: str = ""
     yield_cooldown_until: float = 0.0
+    # Lifetime count of yields, used only as a fair right-of-way tie-break so
+    # equal-priority conflicts alternate instead of always picking one AGV.
+    yield_count: int = 0
     reserved_stage: str = ""
     reserved_zones: Set[str] = field(default_factory=set)
     reservation_deadline: float = 0.0
@@ -2032,6 +2035,9 @@ class AGVScheduler(Node):
             agv.nav_goal_accepted_ts = 0.0
             agv.yield_cooldown_until = (
                 now + self.yield_hold_duration + self.yield_cooldown_duration)
+            # One increment per yield episode (re-entry returns early while
+            # already WAITING) feeds the fair tie-break in _lower_priority_agv.
+            agv.yield_count += 1
 
         if goal_handle:
             goal_handle.cancel_goal_async()
@@ -2200,9 +2206,14 @@ class AGVScheduler(Node):
             return right
         left_priority = left.task.priority if left.task else 0
         right_priority = right.task.priority if right.task else 0
-        if left_priority == right_priority:
-            return max(left, right, key=lambda item: item.aid)
-        return left if left_priority < right_priority else right
+        if left_priority != right_priority:
+            return left if left_priority < right_priority else right
+        # Equal priority: the AGV that has yielded fewer times yields now, so
+        # the two alternate instead of one (lexicographically larger aid)
+        # always losing. aid only breaks an exact yield-count tie.
+        if left.yield_count != right.yield_count:
+            return left if left.yield_count < right.yield_count else right
+        return max(left, right, key=lambda item: item.aid)
 
     def _publish_stop(self, aid: str):
         publisher = self.cmd_publishers.get(aid)
