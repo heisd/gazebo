@@ -508,6 +508,61 @@ def test_fix3_stall_releases_reservation():
           f"flagged={flagged} state={a2.state.value}")
 
 
+def test_fix4_battery_single_source():
+    """fix #4: external battery telemetry and the internal drain/charge model
+    no longer fight over agv.battery. With fresh telemetry the loop leaves the
+    reported value alone; with no/stale telemetry it simulates as before."""
+    import json
+
+    # (1) no telemetry -> the internal model drains (unchanged sim behaviour)
+    b = fresh()
+    State = b.mod.State
+    s = b.sched
+    a1 = s.agvs["agv_01"]
+    a1.state = State.IDLE
+    a1.task = None
+    a1.battery = 80.0
+    a1.last_battery_ts = 0.0
+    a1.vx = a1.wz = 0.0
+    b.sim.SimClock.t = 9000.0
+    s._battery_loop()
+    check("fix#4 with no telemetry the internal model drains",
+          a1.battery < 80.0, f"battery={a1.battery}")
+
+    # (2) fresh telemetry -> _battery_loop must NOT also write the battery
+    b = fresh()
+    State = b.mod.State
+    s = b.sched
+    a1 = s.agvs["agv_01"]
+    a1.state = State.IDLE
+    a1.task = None
+    a1.vx = a1.wz = 0.0
+    b.sim.SimClock.t = 9000.0
+    msg = b.sim.FakeString()
+    msg.data = json.dumps({"agv_id": "agv_01", "battery": 42.0})
+    s._on_status(msg)
+    reported = a1.battery
+    s._battery_loop()
+    check("fix#4 fresh telemetry is authoritative (loop doesn't double-write)",
+          reported == 42.0 and a1.battery == 42.0,
+          f"reported={reported} after_loop={a1.battery}")
+
+    # (3) stale telemetry -> falls back to the internal model
+    b = fresh()
+    State = b.mod.State
+    s = b.sched
+    a1 = s.agvs["agv_01"]
+    a1.state = State.IDLE
+    a1.task = None
+    a1.battery = 60.0
+    a1.vx = a1.wz = 0.0
+    a1.last_battery_ts = 1.0                      # ancient reading
+    b.sim.SimClock.t = 9000.0
+    s._battery_loop()
+    check("fix#4 stale telemetry falls back to the internal model",
+          a1.battery < 60.0, f"battery={a1.battery}")
+
+
 def _corridor_poly(sched):
     z = sched.traffic_zones.get("main_corridor")
     return z.polygon if z else None
@@ -609,6 +664,7 @@ def main():
     test_fix2b_yield_loser_never_pinned_forever()
     test_fix1_wait_release_tolerance()
     test_fix3_stall_releases_reservation()
+    test_fix4_battery_single_source()
     print("\n-- Conflict resolution (deliberate path conflicts) --")
     test_conflict_cross_tasks()
     test_conflict_headon_goto()

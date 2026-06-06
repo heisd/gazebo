@@ -110,6 +110,9 @@ class AGVState:
     pose_source: str = "unknown"
     state: State = State.IDLE
     battery: float = 100.0
+    # When external battery telemetry last arrived; while fresh it is the
+    # single source of truth and the internal drain/charge model stands down.
+    last_battery_ts: float = 0.0
     task: Optional[Task] = None
     vx: float = 0.0
     wz: float = 0.0
@@ -261,6 +264,8 @@ class AGVScheduler(Node):
             self.get_parameter("battery_full_threshold").value)
         self.battery_min_dispatch = float(
             self.get_parameter("battery_min_dispatch").value)
+        self.battery_telemetry_timeout = float(
+            self.get_parameter("battery_telemetry_timeout").value)
         self.path_sample_step = max(0.25, self.route_cell_size / 2.0)
 
         agv_ids = self._string_list_param("agv_ids", ["agv_01"])
@@ -406,6 +411,11 @@ class AGVScheduler(Node):
         self.declare_parameter("battery_critical_threshold", 10.0)
         self.declare_parameter("battery_full_threshold", 95.0)
         self.declare_parameter("battery_min_dispatch", 15.0)
+        # How long a battery reading from /agv_*/agv_status stays authoritative.
+        # While telemetry is this fresh the internal drain/charge model stands
+        # down so the two never fight over agv.battery; with none (e.g. the
+        # offline sim) the internal model runs. 0 disables telemetry deference.
+        self.declare_parameter("battery_telemetry_timeout", 5.0)
         self.declare_parameter("shelf_layout_file", "")
 
     def _load_warehouse_layout(
@@ -638,8 +648,13 @@ class AGVScheduler(Node):
             with self.lock:
                 agv = self.agvs[aid]
                 # Vehicle status is telemetry; scheduler-owned state encodes
-                # reservations, resume targets, and Nav2 goal semantics.
-                agv.battery = float(data.get("battery", agv.battery))
+                # reservations, resume targets, and Nav2 goal semantics. Record
+                # when a real battery reading arrives so _battery_loop yields
+                # the internal model to it (single source of truth).
+                reported = data.get("battery")
+                if reported is not None:
+                    agv.battery = float(reported)
+                    agv.last_battery_ts = time.time()
         except Exception as exc:
             self.get_logger().warn(f"AGV status parse error: {exc}")
 
@@ -1194,24 +1209,40 @@ class AGVScheduler(Node):
                     agv.reservation_deadline = 0.0
             del self.route_reservations[zone]
 
+    def _battery_telemetry_fresh(self, agv: AGVState, now: float) -> bool:
+        """True while a recent external battery reading should own agv.battery,
+        so the internal drain/charge model must not also write it."""
+        return (
+            self.battery_telemetry_timeout > 0.0
+            and agv.last_battery_ts > 0.0
+            and now - agv.last_battery_ts <= self.battery_telemetry_timeout)
+
     def _battery_loop(self):
         charge_agvs = []
         emergency_agvs = []
         fully_charged = []
         with self.lock:
+            now = time.time()
             for agv in self.agvs.values():
+                # When fresh telemetry is driving the battery, the internal
+                # model stands down; otherwise (e.g. the offline sim) simulate.
+                simulate = not self._battery_telemetry_fresh(agv, now)
                 if agv.state == State.CHARGING:
-                    agv.battery = min(
-                        100.0, round(agv.battery + self.battery_charge_rate, 3))
+                    if simulate:
+                        agv.battery = min(
+                            100.0,
+                            round(agv.battery + self.battery_charge_rate, 3))
                     if agv.battery >= self.battery_full_threshold:
                         agv.state = State.IDLE
                         self._release_route_locked(agv.aid)
                         fully_charged.append((agv.aid, agv.battery))
                     continue
 
-                moving = abs(agv.vx) > 0.01 or abs(agv.wz) > 0.01
-                drain = self.battery_drain_moving if moving else self.battery_drain_idle
-                agv.battery = max(0.0, round(agv.battery - drain, 3))
+                if simulate:
+                    moving = abs(agv.vx) > 0.01 or abs(agv.wz) > 0.01
+                    drain = (self.battery_drain_moving if moving
+                             else self.battery_drain_idle)
+                    agv.battery = max(0.0, round(agv.battery - drain, 3))
 
                 if (agv.state == State.TO_CHARGE
                         or (agv.task and agv.task.kind == "charge")):
