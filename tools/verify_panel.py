@@ -313,6 +313,75 @@ def test_fix6_internal_retry_backoff_rearm():
           f"deadline {first_deadline}->{a1.wait_until} now={b.sim.SimClock.t}")
 
 
+def _arm_pinned_yield_loser(b, now=5000.0):
+    """Put agv_02 in a parked yield-WAITING (hold already expired) with the
+    blocker agv_01 sitting 0.8 m away — well inside right_of_way_release_distance
+    so a distance-only resume gate would never fire."""
+    State = b.mod.State
+    Task = b.mod.Task
+    s = b.sched
+    a1, a2 = s.agvs["agv_01"], s.agvs["agv_02"]
+    b.sim.SimClock.t = now
+    loc = s.shelves["B2"]
+    a2.x, a2.y = 10.8, -4.0
+    a2.state = State.WAITING
+    a2.task = Task(tid="LOSER", shelf="B2", shelf_center_xy=loc.center_xy,
+                   pick_xy=loc.pick_xy, pick_yaw=loc.pick_yaw,
+                   aisle_exit_xy=(5.5, loc.pick_xy[1]), drop_xy=s.station_xy,
+                   priority=5, kind="shelf", agv="agv_02")
+    a2.current_goal_handle = None
+    a2.wait_reason = "yield"
+    a2.yielding_to = "agv_01"
+    a2.resume_state = State.TO_STATION
+    a2.resume_goal_xy = s.station_xy
+    a2.resume_goal_yaw = 0.0
+    a2.wait_point_xy = (a2.x, a2.y)
+    a2.yield_cooldown_until = 0.0
+    a1.x, a1.y = 10.0, -4.0   # 0.8 m from the loser (< 1.6 m release distance)
+    return State, s, a1, a2
+
+
+def test_fix2b_yield_loser_never_pinned_forever():
+    """fix #2: a yield loser must never be stuck in WAITING forever.
+
+    The old resume gate only released once dist(loser, blocker) grew past
+    right_of_way_release_distance. If the AGV it yielded to finished its job and
+    parked within that distance, the gap never grew and the loser waited
+    forever. The fix resumes once the blocker is no longer actively driving (or
+    after a hard cap), leaving _safety_loop as the real-time collision guard.
+    """
+    # (1) blocker finished and parked (idle, no live Nav2 goal) right next door
+    b = fresh()
+    State, s, a1, a2 = _arm_pinned_yield_loser(b)
+    a1.state, a1.task, a1.current_goal_handle = State.IDLE, None, None
+    a2.wait_until = b.sim.SimClock.t - 1.0          # intended hold already over
+    s._right_of_way_loop()
+    check("fix#2 yield loser resumes once the blocker parks "
+          "(no permanent WAITING)",
+          a2.state != State.WAITING, f"state={a2.state.value}")
+
+    # (2) no regression: an actively-driving close blocker MUST still hold us
+    b = fresh()
+    State, s, a1, a2 = _arm_pinned_yield_loser(b)
+    a1.state, a1.task = State.TO_STATION, None
+    a1.current_goal_handle = object()               # a live Nav2 goal
+    a2.wait_until = b.sim.SimClock.t - 1.0
+    s._right_of_way_loop()
+    check("fix#2 loser still yields to an actively-moving close blocker",
+          a2.state == State.WAITING, f"state={a2.state.value}")
+
+    # (3) liveness net: even an active close blocker cannot pin past the cap
+    b = fresh()
+    State, s, a1, a2 = _arm_pinned_yield_loser(b)
+    a1.state, a1.task = State.TO_STATION, None
+    a1.current_goal_handle = object()
+    a2.wait_until = b.sim.SimClock.t - (s.yield_max_hold_duration + 1.0)
+    s._right_of_way_loop()
+    check("fix#2 hold is capped at yield_max_hold_duration (liveness net)",
+          a2.state != State.WAITING,
+          f"state={a2.state.value} cap={s.yield_max_hold_duration:.0f}s")
+
+
 def _corridor_poly(sched):
     z = sched.traffic_zones.get("main_corridor")
     return z.polygon if z else None
@@ -411,6 +480,7 @@ def main():
     test_fix4_kind_discrimination()
     test_fix5_completed_counter_and_bounded_history()
     test_fix6_internal_retry_backoff_rearm()
+    test_fix2b_yield_loser_never_pinned_forever()
     print("\n-- Conflict resolution (deliberate path conflicts) --")
     test_conflict_cross_tasks()
     test_conflict_headon_goto()

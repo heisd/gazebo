@@ -217,6 +217,8 @@ class AGVScheduler(Node):
             self.get_parameter("yield_hold_duration").value)
         self.yield_cooldown_duration = float(
             self.get_parameter("yield_cooldown_duration").value)
+        self.yield_max_hold_duration = float(
+            self.get_parameter("yield_max_hold_duration").value)
         self.pickup_pause_duration = float(
             self.get_parameter("pickup_pause_duration").value)
         self.pose_stale_timeout = float(
@@ -358,6 +360,9 @@ class AGVScheduler(Node):
         self.declare_parameter("right_of_way_release_distance", 1.6)
         self.declare_parameter("yield_hold_duration", 2.0)
         self.declare_parameter("yield_cooldown_duration", 3.0)
+        # Liveness cap: a yielding AGV is never held past its intended wait by
+        # more than this many seconds, even if the AGV it yielded to stalls.
+        self.declare_parameter("yield_max_hold_duration", 30.0)
         self.declare_parameter("pickup_pause_duration", 4.0)
         # Off by default: the demo loop dispatches phantom tasks to real
         # AGVs, so it must be opted into explicitly (the committed config
@@ -1989,11 +1994,28 @@ class AGVScheduler(Node):
 
                 if agv.wait_reason == "yield":
                     blocker = self.agvs.get(agv.yielding_to)
-                    if blocker:
-                        dist = math.hypot(agv.x - blocker.x, agv.y - blocker.y)
-                        if dist < self.right_of_way_release_distance:
-                            self._publish_stop(agv.aid)
-                            continue
+                    # Keep holding only while the AGV we yielded to is still
+                    # actively driving toward us AND close. Once it parks
+                    # (idle/charging/waiting, or no live Nav2 goal) it will not
+                    # advance into us, so we resume — _safety_loop stays the
+                    # real-time guard if we close in again. Without this an AGV
+                    # that yielded to a winner which then finished and parked
+                    # within release distance would wait forever. A hard cap on
+                    # the hold is the final safety net for a blocker that
+                    # stalls mid-drive with a live goal.
+                    blocker_active = (
+                        blocker is not None
+                        and blocker.current_goal_handle is not None
+                        and blocker.state not in (
+                            State.IDLE, State.CHARGING, State.WAITING))
+                    pinned_for = now - agv.wait_until
+                    if (blocker_active
+                            and pinned_for < self.yield_max_hold_duration
+                            and math.hypot(agv.x - blocker.x,
+                                           agv.y - blocker.y)
+                            < self.right_of_way_release_distance):
+                        self._publish_stop(agv.aid)
+                        continue
 
                 prep = self._prepare_stage_dispatch_locked(
                     agv,
