@@ -313,6 +313,296 @@ def test_fix6_internal_retry_backoff_rearm():
           f"deadline {first_deadline}->{a1.wait_until} now={b.sim.SimClock.t}")
 
 
+def _arm_pinned_yield_loser(b, now=5000.0):
+    """Put agv_02 in a parked yield-WAITING (hold already expired) with the
+    blocker agv_01 sitting 0.8 m away — well inside right_of_way_release_distance
+    so a distance-only resume gate would never fire."""
+    State = b.mod.State
+    Task = b.mod.Task
+    s = b.sched
+    a1, a2 = s.agvs["agv_01"], s.agvs["agv_02"]
+    b.sim.SimClock.t = now
+    loc = s.shelves["B2"]
+    a2.x, a2.y = 10.8, -4.0
+    a2.state = State.WAITING
+    a2.task = Task(tid="LOSER", shelf="B2", shelf_center_xy=loc.center_xy,
+                   pick_xy=loc.pick_xy, pick_yaw=loc.pick_yaw,
+                   aisle_exit_xy=(5.5, loc.pick_xy[1]), drop_xy=s.station_xy,
+                   priority=5, kind="shelf", agv="agv_02")
+    a2.current_goal_handle = None
+    a2.wait_reason = "yield"
+    a2.yielding_to = "agv_01"
+    a2.resume_state = State.TO_STATION
+    a2.resume_goal_xy = s.station_xy
+    a2.resume_goal_yaw = 0.0
+    a2.wait_point_xy = (a2.x, a2.y)
+    a2.yield_cooldown_until = 0.0
+    a1.x, a1.y = 10.0, -4.0   # 0.8 m from the loser (< 1.6 m release distance)
+    return State, s, a1, a2
+
+
+def test_fix2b_yield_loser_never_pinned_forever():
+    """fix #2: a yield loser must never be stuck in WAITING forever.
+
+    The old resume gate only released once dist(loser, blocker) grew past
+    right_of_way_release_distance. If the AGV it yielded to finished its job and
+    parked within that distance, the gap never grew and the loser waited
+    forever. The fix resumes once the blocker is no longer actively driving (or
+    after a hard cap), leaving _safety_loop as the real-time collision guard.
+    """
+    # (1) blocker finished and parked (idle, no live Nav2 goal) right next door
+    b = fresh()
+    State, s, a1, a2 = _arm_pinned_yield_loser(b)
+    a1.state, a1.task, a1.current_goal_handle = State.IDLE, None, None
+    a2.wait_until = b.sim.SimClock.t - 1.0          # intended hold already over
+    s._right_of_way_loop()
+    check("fix#2 yield loser resumes once the blocker parks "
+          "(no permanent WAITING)",
+          a2.state != State.WAITING, f"state={a2.state.value}")
+
+    # (2) no regression: an actively-driving close blocker MUST still hold us
+    b = fresh()
+    State, s, a1, a2 = _arm_pinned_yield_loser(b)
+    a1.state, a1.task = State.TO_STATION, None
+    a1.current_goal_handle = object()               # a live Nav2 goal
+    a2.wait_until = b.sim.SimClock.t - 1.0
+    s._right_of_way_loop()
+    check("fix#2 loser still yields to an actively-moving close blocker",
+          a2.state == State.WAITING, f"state={a2.state.value}")
+
+    # (3) liveness net: even an active close blocker cannot pin past the cap
+    b = fresh()
+    State, s, a1, a2 = _arm_pinned_yield_loser(b)
+    a1.state, a1.task = State.TO_STATION, None
+    a1.current_goal_handle = object()
+    a2.wait_until = b.sim.SimClock.t - (s.yield_max_hold_duration + 1.0)
+    s._right_of_way_loop()
+    check("fix#2 hold is capped at yield_max_hold_duration (liveness net)",
+          a2.state != State.WAITING,
+          f"state={a2.state.value} cap={s.yield_max_hold_duration:.0f}s")
+
+
+def test_fix1_wait_release_tolerance():
+    """fix #1: releasing the corridor reservation when a yielding AGV reaches
+    its wait point uses a documented, tunable wait_release_tolerance instead of
+    a magic 1.0 m, so the release threshold can be calibrated to the deployment.
+    """
+    def arm(b, offset):
+        """Park the loser `offset` m from its wait point holding a route
+        reservation, fire a SUCCEEDED wait-point goal through _nav_done, and
+        report whether the reservation survived."""
+        State = b.mod.State
+        GoalStatus = b.mod.GoalStatus
+        Task = b.mod.Task
+        s = b.sched
+        a2 = s.agvs["agv_02"]
+        wp = (10.8, -4.0)
+        loc = s.shelves["B2"]
+        task = Task(tid="L1", shelf="B2", shelf_center_xy=loc.center_xy,
+                    pick_xy=loc.pick_xy, pick_yaw=loc.pick_yaw,
+                    aisle_exit_xy=(5.5, loc.pick_xy[1]), drop_xy=s.station_xy,
+                    priority=5, kind="shelf", agv="agv_02")
+        with s.lock:
+            s._reserve_stage_locked(a2, task, State.TO_STATION,
+                                    start_xy=(a2.x, a2.y))
+            a2.state = State.WAITING
+            a2.task = task
+            a2.wait_reason = "yield"
+            a2.wait_point_xy = wp
+            a2.current_goal_handle = object()
+            seq = a2.nav_goal_seq
+        a2.x, a2.y = wp[0] + offset, wp[1]
+        f = b.sim.FakeFuture()
+        f.set_result(b.sim.FakeResult(GoalStatus.STATUS_SUCCEEDED))
+        s._nav_done(f, "agv_02", task.tid, seq)
+        held = any(r.agv_id == "agv_02" for r in s.route_reservations.values())
+        return held, a2
+
+    tol = fresh().sched.wait_release_tolerance
+
+    # arrived at the wait point (well within tolerance) -> corridor freed
+    held_near, a2n = arm(fresh(), tol * 0.5)
+    check("fix#1 reaching the wait point frees the route reservation",
+          not held_near and not a2n.reserved_zones,
+          f"held={held_near} reserved={sorted(a2n.reserved_zones)}")
+
+    # a SUCCEEDED reported well beyond tolerance must NOT release (guard holds)
+    held_far, _ = arm(fresh(), tol + 0.5)
+    check("fix#1 a far 'arrival' does NOT release (tolerance guard holds)",
+          held_far, f"held={held_far}")
+
+    # tightening the parameter below the 0.5 m gap flips the decision, proving
+    # the threshold is the parameter and not a hardcoded 1.0 m
+    b = fresh()
+    b.sched.wait_release_tolerance = 0.2
+    held_tight, _ = arm(b, 0.5)
+    check("fix#1 release threshold honours the parameter (not a hardcoded 1.0)",
+          held_tight, f"held_at_0.5m_with_tol_0.2={held_tight}")
+
+
+def test_fix3_stall_releases_reservation():
+    """fix #3: an AGV holding a route reservation that makes no progress toward
+    its accepted goal (Nav2 stalled while odom stays fresh) is requeued and its
+    cells freed, so it can no longer starve others by auto-renewing forever; an
+    AGV that keeps making progress is never flagged."""
+    def arm(b):
+        State = b.mod.State
+        Task = b.mod.Task
+        s = b.sched
+        a2 = s.agvs["agv_02"]
+        loc = s.shelves["B2"]
+        task = Task(tid="STUCK", shelf="B2", shelf_center_xy=loc.center_xy,
+                    pick_xy=loc.pick_xy, pick_yaw=loc.pick_yaw,
+                    aisle_exit_xy=(5.5, loc.pick_xy[1]), drop_xy=s.station_xy,
+                    priority=5, kind="shelf", agv="agv_02")
+        a2.x, a2.y = 0.0, 0.0
+        with s.lock:
+            s._reserve_stage_locked(a2, task, State.TO_STATION,
+                                    start_xy=(a2.x, a2.y))
+        a2.state = State.TO_STATION
+        a2.task = task
+        a2.current_goal_xy = s.station_xy
+        a2.current_goal_handle = object()
+        a2.nav_goal_sent_ts = a2.nav_goal_accepted_ts = b.sim.SimClock.t
+        a2.last_progress_ts = 0.0
+        a2.last_progress_dist = float("inf")
+        return State, s, a2
+
+    held = lambda s: any(r.agv_id == "agv_02"
+                         for r in s.route_reservations.values())
+
+    # (1) stuck: never moves (but odom stays fresh) -> flagged, cells released
+    b = fresh()
+    t0 = 4000.0
+    b.sim.SimClock.t = t0
+    State, s, a2 = arm(b)
+    held0 = held(s)
+    fired = False
+    for k in range(int(s.nav_stall_timeout) + 5):
+        b.sim.SimClock.t = t0 + k
+        a2.last_odom_ts = b.sim.SimClock.t       # powered robot: odom stays fresh
+        s._nav_watchdog()
+        if a2.state != State.TO_STATION:
+            fired = True
+            break
+    check("fix#3 a stalled AGV is requeued and frees its reserved cells",
+          held0 and fired and not held(s) and not a2.reserved_zones,
+          f"held0={held0} fired={fired} held_after={held(s)} "
+          f"state={a2.state.value}")
+
+    # (2) progressing: crawls toward the goal each tick -> never flagged
+    b = fresh()
+    b.sim.SimClock.t = t0
+    State, s, a2 = arm(b)
+    flagged = False
+    for k in range(int(s.nav_stall_timeout) + 5):
+        b.sim.SimClock.t = t0 + k
+        a2.last_odom_ts = b.sim.SimClock.t
+        a2.x = min(s.station_xy[0], 0.1 * k)     # 0.1 m/tick toward the station
+        s._nav_watchdog()
+        if a2.state != State.TO_STATION:
+            flagged = True
+            break
+    check("fix#3 an AGV that keeps making progress is NOT flagged",
+          not flagged and a2.state == State.TO_STATION,
+          f"flagged={flagged} state={a2.state.value}")
+
+
+def test_fix4_battery_single_source():
+    """fix #4: external battery telemetry and the internal drain/charge model
+    no longer fight over agv.battery. With fresh telemetry the loop leaves the
+    reported value alone; with no/stale telemetry it simulates as before."""
+    import json
+
+    # (1) no telemetry -> the internal model drains (unchanged sim behaviour)
+    b = fresh()
+    State = b.mod.State
+    s = b.sched
+    a1 = s.agvs["agv_01"]
+    a1.state = State.IDLE
+    a1.task = None
+    a1.battery = 80.0
+    a1.last_battery_ts = 0.0
+    a1.vx = a1.wz = 0.0
+    b.sim.SimClock.t = 9000.0
+    s._battery_loop()
+    check("fix#4 with no telemetry the internal model drains",
+          a1.battery < 80.0, f"battery={a1.battery}")
+
+    # (2) fresh telemetry -> _battery_loop must NOT also write the battery
+    b = fresh()
+    State = b.mod.State
+    s = b.sched
+    a1 = s.agvs["agv_01"]
+    a1.state = State.IDLE
+    a1.task = None
+    a1.vx = a1.wz = 0.0
+    b.sim.SimClock.t = 9000.0
+    msg = b.sim.FakeString()
+    msg.data = json.dumps({"agv_id": "agv_01", "battery": 42.0})
+    s._on_status(msg)
+    reported = a1.battery
+    s._battery_loop()
+    check("fix#4 fresh telemetry is authoritative (loop doesn't double-write)",
+          reported == 42.0 and a1.battery == 42.0,
+          f"reported={reported} after_loop={a1.battery}")
+
+    # (3) stale telemetry -> falls back to the internal model
+    b = fresh()
+    State = b.mod.State
+    s = b.sched
+    a1 = s.agvs["agv_01"]
+    a1.state = State.IDLE
+    a1.task = None
+    a1.battery = 60.0
+    a1.vx = a1.wz = 0.0
+    a1.last_battery_ts = 1.0                      # ancient reading
+    b.sim.SimClock.t = 9000.0
+    s._battery_loop()
+    check("fix#4 stale telemetry falls back to the internal model",
+          a1.battery < 60.0, f"battery={a1.battery}")
+
+
+def test_fix5_fair_yield_tiebreak():
+    """fix #5: equal-priority right-of-way ties no longer always pick the same
+    (lexicographically larger) AGV. The one that has yielded fewer times yields
+    next, so over repeated conflicts the two alternate instead of one AGV
+    always losing."""
+    b = fresh()
+    Task = b.mod.Task
+    s = b.sched
+    a1, a2 = s.agvs["agv_01"], s.agvs["agv_02"]
+
+    def mk():
+        return Task(tid="x", shelf="A1", shelf_center_xy=(0, 0), pick_xy=(0, 0),
+                    pick_yaw=0.0, aisle_exit_xy=(0, 0), drop_xy=(0, 0),
+                    priority=1)
+
+    a1.task = mk()
+    a2.task = mk()
+    victims = []
+    for _ in range(6):
+        v = s._lower_priority_agv(a1, a2)        # equal priority -> tie-break
+        victims.append(v.aid)
+        v.yield_count += 1                        # the yield that would follow
+    alternates = (len(set(victims)) == 2
+                  and victims[0] != victims[1]
+                  and victims.count("agv_01") == victims.count("agv_02"))
+    check("fix#5 equal-priority yield tie-break alternates (no fixed loser)",
+          alternates, f"victims={victims}")
+
+    # higher priority still wins regardless of yield history (lower number =
+    # higher priority loser; priority field: larger = more important)
+    a1.task = mk()
+    a2.task = mk()
+    a1.task.priority = 1
+    a2.task.priority = 9
+    a1.yield_count = 100      # even with a huge yield debt, priority dominates
+    v = s._lower_priority_agv(a1, a2)
+    check("fix#5 priority still dominates the fair tie-break",
+          v.aid == "agv_01", f"victim={v.aid}")
+
+
 def _corridor_poly(sched):
     z = sched.traffic_zones.get("main_corridor")
     return z.polygon if z else None
@@ -411,6 +701,11 @@ def main():
     test_fix4_kind_discrimination()
     test_fix5_completed_counter_and_bounded_history()
     test_fix6_internal_retry_backoff_rearm()
+    test_fix2b_yield_loser_never_pinned_forever()
+    test_fix1_wait_release_tolerance()
+    test_fix3_stall_releases_reservation()
+    test_fix4_battery_single_source()
+    test_fix5_fair_yield_tiebreak()
     print("\n-- Conflict resolution (deliberate path conflicts) --")
     test_conflict_cross_tasks()
     test_conflict_headon_goto()
