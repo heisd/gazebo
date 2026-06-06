@@ -225,6 +225,8 @@ class AGVScheduler(Node):
             self.get_parameter("pose_stale_timeout").value)
         self.wait_point_tolerance = float(
             self.get_parameter("wait_point_tolerance").value)
+        self.wait_release_tolerance = float(
+            self.get_parameter("wait_release_tolerance").value)
         self.pose_source_mode = str(
             self.get_parameter("pose_source").value or "map_then_odom")
         self.map_frame = str(self.get_parameter("map_frame").value or "map")
@@ -356,6 +358,14 @@ class AGVScheduler(Node):
         self.declare_parameter("reservation_refresh_interval", 2.0)
         self.declare_parameter("pose_stale_timeout", 8.0)
         self.declare_parameter("wait_point_tolerance", 0.35)
+        # Distance to its wait point within which a yielding AGV counts as
+        # having cleared the contested corridor and releases its route
+        # reservation. Deliberately >= wait_point_tolerance: the wait point is
+        # off-corridor and _safety_loop still guards real-time proximity, so we
+        # bias toward freeing the corridor over holding it (too tight a value
+        # would strand the AGV we yielded to). Calibrate to the Nav2
+        # xy_goal_tolerance and wait-point geometry on real hardware.
+        self.declare_parameter("wait_release_tolerance", 1.0)
         self.declare_parameter("safety_stop_distance", 1.0)
         self.declare_parameter("right_of_way_release_distance", 1.6)
         self.declare_parameter("yield_hold_duration", 2.0)
@@ -1655,10 +1665,11 @@ class AGVScheduler(Node):
             agv.nav_goal_accepted_ts = 0.0
 
             if agv.state == State.WAITING:
-                if status == GoalStatus.STATUS_SUCCEEDED:
-                    if agv.wait_point_xy and math.hypot(
-                            agv.x - agv.wait_point_xy[0],
-                            agv.y - agv.wait_point_xy[1]) <= 1.0:
+                if status == GoalStatus.STATUS_SUCCEEDED and agv.wait_point_xy:
+                    reached = math.hypot(
+                        agv.x - agv.wait_point_xy[0],
+                        agv.y - agv.wait_point_xy[1])
+                    if reached <= self.wait_release_tolerance:
                         self._release_route_locked(agv.aid)
                         wait_release = True
                 publish_stop = True

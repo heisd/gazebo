@@ -382,6 +382,64 @@ def test_fix2b_yield_loser_never_pinned_forever():
           f"state={a2.state.value} cap={s.yield_max_hold_duration:.0f}s")
 
 
+def test_fix1_wait_release_tolerance():
+    """fix #1: releasing the corridor reservation when a yielding AGV reaches
+    its wait point uses a documented, tunable wait_release_tolerance instead of
+    a magic 1.0 m, so the release threshold can be calibrated to the deployment.
+    """
+    def arm(b, offset):
+        """Park the loser `offset` m from its wait point holding a route
+        reservation, fire a SUCCEEDED wait-point goal through _nav_done, and
+        report whether the reservation survived."""
+        State = b.mod.State
+        GoalStatus = b.mod.GoalStatus
+        Task = b.mod.Task
+        s = b.sched
+        a2 = s.agvs["agv_02"]
+        wp = (10.8, -4.0)
+        loc = s.shelves["B2"]
+        task = Task(tid="L1", shelf="B2", shelf_center_xy=loc.center_xy,
+                    pick_xy=loc.pick_xy, pick_yaw=loc.pick_yaw,
+                    aisle_exit_xy=(5.5, loc.pick_xy[1]), drop_xy=s.station_xy,
+                    priority=5, kind="shelf", agv="agv_02")
+        with s.lock:
+            s._reserve_stage_locked(a2, task, State.TO_STATION,
+                                    start_xy=(a2.x, a2.y))
+            a2.state = State.WAITING
+            a2.task = task
+            a2.wait_reason = "yield"
+            a2.wait_point_xy = wp
+            a2.current_goal_handle = object()
+            seq = a2.nav_goal_seq
+        a2.x, a2.y = wp[0] + offset, wp[1]
+        f = b.sim.FakeFuture()
+        f.set_result(b.sim.FakeResult(GoalStatus.STATUS_SUCCEEDED))
+        s._nav_done(f, "agv_02", task.tid, seq)
+        held = any(r.agv_id == "agv_02" for r in s.route_reservations.values())
+        return held, a2
+
+    tol = fresh().sched.wait_release_tolerance
+
+    # arrived at the wait point (well within tolerance) -> corridor freed
+    held_near, a2n = arm(fresh(), tol * 0.5)
+    check("fix#1 reaching the wait point frees the route reservation",
+          not held_near and not a2n.reserved_zones,
+          f"held={held_near} reserved={sorted(a2n.reserved_zones)}")
+
+    # a SUCCEEDED reported well beyond tolerance must NOT release (guard holds)
+    held_far, _ = arm(fresh(), tol + 0.5)
+    check("fix#1 a far 'arrival' does NOT release (tolerance guard holds)",
+          held_far, f"held={held_far}")
+
+    # tightening the parameter below the 0.5 m gap flips the decision, proving
+    # the threshold is the parameter and not a hardcoded 1.0 m
+    b = fresh()
+    b.sched.wait_release_tolerance = 0.2
+    held_tight, _ = arm(b, 0.5)
+    check("fix#1 release threshold honours the parameter (not a hardcoded 1.0)",
+          held_tight, f"held_at_0.5m_with_tol_0.2={held_tight}")
+
+
 def _corridor_poly(sched):
     z = sched.traffic_zones.get("main_corridor")
     return z.polygon if z else None
@@ -481,6 +539,7 @@ def main():
     test_fix5_completed_counter_and_bounded_history()
     test_fix6_internal_retry_backoff_rearm()
     test_fix2b_yield_loser_never_pinned_forever()
+    test_fix1_wait_release_tolerance()
     print("\n-- Conflict resolution (deliberate path conflicts) --")
     test_conflict_cross_tasks()
     test_conflict_headon_goto()

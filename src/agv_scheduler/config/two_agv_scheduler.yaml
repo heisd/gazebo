@@ -23,6 +23,7 @@ agv_scheduler:
     reservation_refresh_interval: 2.0
     pose_stale_timeout: 8.0
     wait_point_tolerance: 0.35
+    wait_release_tolerance: 1.0
     safety_stop_distance: 1.0
     right_of_way_release_distance: 1.6
     yield_hold_duration: 2.0
