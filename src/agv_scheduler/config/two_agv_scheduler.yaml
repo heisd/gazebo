@@ -22,6 +22,7 @@ agv_scheduler:
     route_hold_timeout: 180.0
     reservation_refresh_interval: 2.0
     pose_stale_timeout: 8.0
+    nav_stall_timeout: 30.0
     wait_point_tolerance: 0.35
     wait_release_tolerance: 1.0
     safety_stop_distance: 1.0

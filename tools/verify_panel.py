@@ -440,6 +440,74 @@ def test_fix1_wait_release_tolerance():
           held_tight, f"held_at_0.5m_with_tol_0.2={held_tight}")
 
 
+def test_fix3_stall_releases_reservation():
+    """fix #3: an AGV holding a route reservation that makes no progress toward
+    its accepted goal (Nav2 stalled while odom stays fresh) is requeued and its
+    cells freed, so it can no longer starve others by auto-renewing forever; an
+    AGV that keeps making progress is never flagged."""
+    def arm(b):
+        State = b.mod.State
+        Task = b.mod.Task
+        s = b.sched
+        a2 = s.agvs["agv_02"]
+        loc = s.shelves["B2"]
+        task = Task(tid="STUCK", shelf="B2", shelf_center_xy=loc.center_xy,
+                    pick_xy=loc.pick_xy, pick_yaw=loc.pick_yaw,
+                    aisle_exit_xy=(5.5, loc.pick_xy[1]), drop_xy=s.station_xy,
+                    priority=5, kind="shelf", agv="agv_02")
+        a2.x, a2.y = 0.0, 0.0
+        with s.lock:
+            s._reserve_stage_locked(a2, task, State.TO_STATION,
+                                    start_xy=(a2.x, a2.y))
+        a2.state = State.TO_STATION
+        a2.task = task
+        a2.current_goal_xy = s.station_xy
+        a2.current_goal_handle = object()
+        a2.nav_goal_sent_ts = a2.nav_goal_accepted_ts = b.sim.SimClock.t
+        a2.last_progress_ts = 0.0
+        a2.last_progress_dist = float("inf")
+        return State, s, a2
+
+    held = lambda s: any(r.agv_id == "agv_02"
+                         for r in s.route_reservations.values())
+
+    # (1) stuck: never moves (but odom stays fresh) -> flagged, cells released
+    b = fresh()
+    t0 = 4000.0
+    b.sim.SimClock.t = t0
+    State, s, a2 = arm(b)
+    held0 = held(s)
+    fired = False
+    for k in range(int(s.nav_stall_timeout) + 5):
+        b.sim.SimClock.t = t0 + k
+        a2.last_odom_ts = b.sim.SimClock.t       # powered robot: odom stays fresh
+        s._nav_watchdog()
+        if a2.state != State.TO_STATION:
+            fired = True
+            break
+    check("fix#3 a stalled AGV is requeued and frees its reserved cells",
+          held0 and fired and not held(s) and not a2.reserved_zones,
+          f"held0={held0} fired={fired} held_after={held(s)} "
+          f"state={a2.state.value}")
+
+    # (2) progressing: crawls toward the goal each tick -> never flagged
+    b = fresh()
+    b.sim.SimClock.t = t0
+    State, s, a2 = arm(b)
+    flagged = False
+    for k in range(int(s.nav_stall_timeout) + 5):
+        b.sim.SimClock.t = t0 + k
+        a2.last_odom_ts = b.sim.SimClock.t
+        a2.x = min(s.station_xy[0], 0.1 * k)     # 0.1 m/tick toward the station
+        s._nav_watchdog()
+        if a2.state != State.TO_STATION:
+            flagged = True
+            break
+    check("fix#3 an AGV that keeps making progress is NOT flagged",
+          not flagged and a2.state == State.TO_STATION,
+          f"flagged={flagged} state={a2.state.value}")
+
+
 def _corridor_poly(sched):
     z = sched.traffic_zones.get("main_corridor")
     return z.polygon if z else None
@@ -540,6 +608,7 @@ def main():
     test_fix6_internal_retry_backoff_rearm()
     test_fix2b_yield_loser_never_pinned_forever()
     test_fix1_wait_release_tolerance()
+    test_fix3_stall_releases_reservation()
     print("\n-- Conflict resolution (deliberate path conflicts) --")
     test_conflict_cross_tasks()
     test_conflict_headon_goto()

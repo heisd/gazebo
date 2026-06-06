@@ -121,6 +121,10 @@ class AGVState:
     nav_goal_sent_ts: float = 0.0
     nav_goal_accepted_ts: float = 0.0
     nav_goal_seq: int = 0
+    # Progress watchdog: closest distance to the current goal seen so far and
+    # when it was last improved, used to catch an accepted goal that stalls.
+    last_progress_ts: float = 0.0
+    last_progress_dist: float = float("inf")
     pause_until: float = 0.0
     resume_state: State = State.IDLE
     resume_goal_xy: Optional[Tuple[float, float]] = None
@@ -190,6 +194,15 @@ class AGVScheduler(Node):
     # may not use them so command routing/dedup can't be spoofed.
     INTERNAL_TID_PREFIXES = ("CHARGE_", "RETURN_", "MANUAL_")
     HISTORY_LIMIT = 200
+    # Driving states that hold a route reservation and are expected to make
+    # progress toward a goal; the stall watchdog only applies to these.
+    NAV_PROGRESS_STATES = frozenset({
+        State.TO_SHELF, State.TO_AISLE_EXIT, State.TO_STATION,
+        State.RETURNING, State.TO_CHARGE,
+    })
+    # Metres of goal-distance improvement that counts as real progress (above
+    # pose/odom jitter), so a stalled AGV is not credited for noise.
+    NAV_PROGRESS_EPSILON = 0.05
 
     def __init__(self):
         super().__init__("agv_scheduler")
@@ -227,6 +240,8 @@ class AGVScheduler(Node):
             self.get_parameter("wait_point_tolerance").value)
         self.wait_release_tolerance = float(
             self.get_parameter("wait_release_tolerance").value)
+        self.nav_stall_timeout = float(
+            self.get_parameter("nav_stall_timeout").value)
         self.pose_source_mode = str(
             self.get_parameter("pose_source").value or "map_then_odom")
         self.map_frame = str(self.get_parameter("map_frame").value or "map")
@@ -357,6 +372,12 @@ class AGVScheduler(Node):
         self.declare_parameter("route_hold_timeout", 180.0)
         self.declare_parameter("reservation_refresh_interval", 2.0)
         self.declare_parameter("pose_stale_timeout", 8.0)
+        # An AGV that holds a route reservation but makes no progress toward its
+        # accepted goal for this long is treated as stalled: its goal is
+        # aborted and its task requeued so it stops starving others of the
+        # reserved cells. 0 disables the check. Keep well above a normal leg's
+        # duration to avoid false positives during Nav2 recovery behaviours.
+        self.declare_parameter("nav_stall_timeout", 30.0)
         self.declare_parameter("wait_point_tolerance", 0.35)
         # Distance to its wait point within which a yielding AGV counts as
         # having cleared the contested corridor and releases its route
@@ -1632,6 +1653,9 @@ class AGVScheduler(Node):
                 return
             current.current_goal_handle = goal_handle
             current.nav_goal_accepted_ts = time.time()
+            # Start the progress watchdog fresh for this goal.
+            current.last_progress_ts = time.time()
+            current.last_progress_dist = float("inf")
 
         goal_handle.get_result_async().add_done_callback(
             lambda f, aid=aid, tid=task_id, seq=goal_seq:
@@ -1886,6 +1910,10 @@ class AGVScheduler(Node):
         agv.wait_reason = "internal_retry"
         agv.wait_zone = reason
         agv.yielding_to = ""
+        # Don't squat on the reserved cells while parked waiting to retry; the
+        # retry re-reserves via _prepare_stage_dispatch_locked. This keeps a
+        # stalled internal move from starving others of its route.
+        self._release_route_locked(agv.aid)
         task.status = f"waiting:{reason}"
 
     def _return_task_to_queue(self, agv: AGVState, task: Task, reason: str):
@@ -2107,6 +2135,29 @@ class AGVScheduler(Node):
                         agv.task,
                         "Nav2 goal was not accepted within 5s",
                     ))
+                    continue
+                # Stall watchdog: an accepted goal in a driving state that makes
+                # no measurable progress for nav_stall_timeout is stuck (Nav2
+                # stalled while odom keeps publishing). Requeue it so it stops
+                # holding — and auto-renewing — its reserved cells forever.
+                if (self.nav_stall_timeout > 0.0
+                        and agv.current_goal_handle is not None
+                        and agv.current_goal_xy is not None
+                        and agv.state in self.NAV_PROGRESS_STATES):
+                    goal_dist = math.hypot(
+                        agv.x - agv.current_goal_xy[0],
+                        agv.y - agv.current_goal_xy[1])
+                    if goal_dist + self.NAV_PROGRESS_EPSILON < agv.last_progress_dist:
+                        agv.last_progress_dist = goal_dist
+                        agv.last_progress_ts = now
+                    elif (agv.last_progress_ts > 0.0
+                            and now - agv.last_progress_ts > self.nav_stall_timeout):
+                        victims.append((
+                            agv,
+                            agv.task,
+                            f"no progress toward goal for "
+                            f"{self.nav_stall_timeout:.0f}s (stalled)",
+                        ))
 
         for agv, task, reason in victims:
             self._return_task_to_queue(agv, task, reason)
